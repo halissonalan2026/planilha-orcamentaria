@@ -358,6 +358,7 @@ BASE_CSS = '''
         outline: none;
         background: #111318;
         color: #ffffff;
+        max-width: 100%;
     }
     input:focus, select:focus {
         border-color: #d4af37;
@@ -394,30 +395,101 @@ BASE_CSS = '''
         margin: 15px 0;
     }
 
-    /* RESPONSIVIDADE PARA TELEMÓVEIS / CELULARES */
+    /* RESPONSIVIDADE PARA TELEMÓVEIS (Telas abaixo de 768px) */
     @media (max-width: 768px) {
         .sidebar {
-            width: 70px;
-            overflow: hidden;
+            width: 100%;
+            height: auto;
+            position: relative;
+            box-shadow: none;
         }
-        .sidebar-header h2, .sidebar-menu li a span, .sidebar-footer a span {
-            display: none;
+        .sidebar-menu {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            padding: 5px;
+        }
+        .sidebar-menu li a {
+            padding: 8px 12px;
+            font-size: 12px;
+            border-left: none;
+            border-bottom: 3px solid transparent;
+        }
+        .sidebar-menu li a.active, .sidebar-menu li a:hover {
+            border-left-color: transparent;
+            border-bottom-color: #d4af37;
+        }
+        .sidebar-footer {
+            display: none; /* Oculta o sair no mobile para economizar espaço */
         }
         .main-wrapper {
-            margin-left: 70px;
-            width: calc(100% - 70px);
-        }
-        .metrics-container {
-            grid-template-columns: 1fr;
-        }
-        .content-area {
-            padding: 15px;
+            margin-left: 0;
+            width: 100%;
         }
         .top-navbar {
             padding: 0 15px;
+            height: 60px;
+        }
+        .content-area {
+            padding: 15px 10px;
+        }
+        .metrics-container {
+            grid-template-columns: 1fr;
+            gap: 15px;
+        }
+        .card {
+            padding: 15px;
         }
     }
 '''
+
+def render_layout(body_content, active_menu='resumo'):
+    menu_active = {
+        'resumo': '', 'clientes': '', 'obra': '', 'fornecedores': '', 'estoque': ''
+    }
+    menu_active[active_menu] = 'active'
+    
+    return render_template_string(f'''
+        <!DOCTYPE html>
+        <html lang="pt">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Construtora Quality - Painel de Engenharia</title>
+            <style>'''+ BASE_CSS +'''</style>
+        </head>
+        <body>
+            <div class="sidebar">
+                <div class="sidebar-header">
+                    <img src="/static/logo.jpg" alt="Logo">
+                    <h2>CONSTRUTORA QUALITY</h2>
+                </div>
+                <ul class="sidebar-menu">
+                    <li><a href="/" class="{menu_active['resumo']}">📊 <span>Resumo</span></a></li>
+                    <li><a href="/novo_cliente" class="{menu_active['clientes']}">👤 <span>Clientes</span></a></li>
+                    <li><a href="/nova_obra" class="{menu_active['obra']}">🏗️ <span>Registar</span></a></li>
+                    <li><a href="/fornecedores" class="{menu_active['fornecedores']}">🤝 <span>Fornecedores</span></a></li>
+                    <li><a href="/estoque" class="{menu_active['estoque']}">📦 <span>Stock</span></a></li>
+                </ul>
+                <div class="sidebar-footer">
+                    <a href="/">🚪 Sair do Sistema</a>
+                </div>
+            </div>
+            
+            <div class="main-wrapper">
+                <div class="top-navbar">
+                    <span style="font-weight: 600; font-size: 13px; letter-spacing: 0.5px; color: #d4af37;">GESTÃO DE OBRAS</span>
+                    <div class="user-info">
+                        <span style="font-size: 13px;">Quality ▾</span>
+                    </div>
+                </div>
+                <div class="content-area">
+                    '''+ body_content +'''
+                </div>
+            </div>
+        </body>
+        </html>
+    ''')
 
 def render_layout(body_content, active_menu='resumo'):
     menu_active = {
