@@ -306,15 +306,16 @@ BASE_CSS = '''
     .btn {
         background: #d4af37;
         color: #111318;
-        padding: 9px 18px;
+        padding: 12px 20px;
         text-decoration: none;
         border-radius: 6px;
         display: inline-block;
         font-weight: 600;
         border: none;
         cursor: pointer;
-        font-size: 13px;
+        font-size: 14px;
         transition: all 0.2s;
+        text-align: center;
     }
     .btn:hover {
         background: #e6be40;
@@ -351,14 +352,16 @@ BASE_CSS = '''
         background: rgba(231, 76, 60, 0.3);
     }
     input, select {
-        padding: 9px 12px;
+        padding: 12px;
         border: 1px solid #2d3748;
         border-radius: 6px;
-        font-size: 13px;
+        font-size: 14px;
         outline: none;
         background: #111318;
         color: #ffffff;
-        max-width: 100%;
+        width: 100%;
+        margin-top: 5px;
+        margin-bottom: 12px;
     }
     input:focus, select:focus {
         border-color: #d4af37;
@@ -370,7 +373,7 @@ BASE_CSS = '''
         color: #d4af37;
         font-weight: 600;
         text-decoration: none;
-        font-size: 13px;
+        font-size: 14px;
     }
     a.voltar:hover {
         text-decoration: underline;
@@ -395,7 +398,7 @@ BASE_CSS = '''
         margin: 15px 0;
     }
 
-    /* RESPONSIVIDADE PARA TELEMÓVEIS (Telas abaixo de 768px) */
+    /* RESPONSIVIDADE TOTAL PARA TELEMÓVEIS (Abaixo de 768px) */
     @media (max-width: 768px) {
         .sidebar {
             width: 100%;
@@ -403,42 +406,57 @@ BASE_CSS = '''
             position: relative;
             box-shadow: none;
         }
+        .sidebar-header {
+            padding: 12px 15px;
+        }
+        .sidebar-header img {
+            width: 32px;
+            height: 32px;
+        }
+        .sidebar-header h2 {
+            font-size: 12px;
+        }
         .sidebar-menu {
             display: flex;
             flex-wrap: wrap;
-            justify-content: center;
-            padding: 5px;
+            justify-content: space-around;
+            padding: 8px 5px;
+            background: #111318;
         }
         .sidebar-menu li a {
-            padding: 8px 12px;
-            font-size: 12px;
+            padding: 8px 10px;
+            font-size: 11px;
             border-left: none;
             border-bottom: 3px solid transparent;
+            color: #fff;
         }
         .sidebar-menu li a.active, .sidebar-menu li a:hover {
             border-left-color: transparent;
             border-bottom-color: #d4af37;
+            color: #d4af37;
         }
         .sidebar-footer {
-            display: none; /* Oculta o sair no mobile para economizar espaço */
+            display: none;
         }
         .main-wrapper {
             margin-left: 0;
             width: 100%;
         }
         .top-navbar {
-            padding: 0 15px;
-            height: 60px;
+            display: none; /* Oculta a barra superior duplicada no mobile */
         }
         .content-area {
-            padding: 15px 10px;
+            padding: 15px 12px;
         }
         .metrics-container {
             grid-template-columns: 1fr;
-            gap: 15px;
+            gap: 12px;
         }
         .card {
-            padding: 15px;
+            padding: 18px 15px;
+        }
+        h1 {
+            font-size: 20px !important;
         }
     }
 '''
