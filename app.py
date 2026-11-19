@@ -1,95 +1,39 @@
-from flask import Flask, render_template_string, request, redirect, url_for, send_from_directory
-import sqlite3
+from datetime import date, timedelta
+from functools import wraps
 import os
+import re
+import sqlite3
+from flask import (
+    Flask,
+    redirect,
+    render_template_string,
+    request,
+    send_from_directory,
+    session,
+    url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "construtora-quality-chave-2026")
 
-UPLOAD_FOLDER = 'static/uploads'
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "construtora-quality-chave-2026")
+
+# Credenciais de acesso (pode alterar ou configurar via variável de ambiente)
+USUARIO_LOGIN = os.environ.get("APP_USER", "admin")
+SENHA_LOGIN = os.environ.get("APP_PASS", "quality123")
+
+UPLOAD_FOLDER = "static/uploads"
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-def get_db_connection():
-    conn = sqlite3.connect('orcamento_obras.db')
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db_connection()
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS clientes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL,
-            telefone TEXT,
-            endereco TEXT
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS fornecedores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL,
-            telefone TEXT,
-            material_principal TEXT
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS estoque (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            descricao TEXT NOT NULL,
-            fornecedor_id INTEGER,
-            unidade TEXT NOT NULL DEFAULT 'un',
-            qtd_comprada REAL NOT NULL,
-            valor_total_lote REAL NOT NULL,
-            valor_unitario REAL GENERATED ALWAYS AS (valor_total_lote / NULLIF(qtd_comprada, 0)) STORED,
-            FOREIGN KEY (fornecedor_id) REFERENCES fornecedores (id)
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS obras (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            cliente_id INTEGER,
-            nome_obra TEXT NOT NULL,
-            valor_financiamento REAL DEFAULT 0,
-            valor_entrada REAL DEFAULT 0,
-            valor_terreno REAL DEFAULT 0,
-            metro_quadrado REAL DEFAULT 0,
-            pdf_projeto TEXT,
-            FOREIGN KEY (cliente_id) REFERENCES clientes (id)
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS etapas_obra (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            obra_id INTEGER,
-            nome_etapa TEXT NOT NULL,
-            percentual REAL DEFAULT 0,
-            FOREIGN KEY (obra_id) REFERENCES obras (id)
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS materiais_obra (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            obra_id INTEGER,
-            fornecedor_id INTEGER,
-            estoque_id INTEGER,
-            descricao TEXT NOT NULL,
-            unidade TEXT NOT NULL DEFAULT 'un',
-            quantidade REAL NOT NULL,
-            valor_unitario REAL NOT NULL,
-            valor_total REAL GENERATED ALWAYS AS (quantidade * valor_unitario) STORED,
-            FOREIGN KEY (obra_id) REFERENCES obras (id),
-            FOREIGN KEY (fornecedor_id) REFERENCES fornecedores (id),
-            FOREIGN KEY (estoque_id) REFERENCES estoque (id)
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
 
 ETAPAS_PADRAO = [
     "Serviços Preliminares e Gerais",
     "Infraestrutura",
-    "Supraestrutura",
+    "Superestrutura",
     "Paredes e Painéis",
     "Esquadrias",
     "Vidros e Plásticos",
@@ -105,10 +49,257 @@ ETAPAS_PADRAO = [
     "Instalações Hidráulicas",
     "Inst. Esgoto e Águas Pluviais",
     "Louças e Metais",
-    "Outros Serviços (Muro, portão, calçada)"
+    "Outros Serviços (Muro, portão, calçada)",
 ]
 
-BASE_CSS = '''
+CATEGORIAS_OBRA = ["Alvenaria", "Hidráulica", "Elétrica", "Pintura"]
+
+
+def format_brl(valor):
+    """Formata número no padrão brasileiro: R$ 1.234,56"""
+    try:
+        num = float(valor or 0.0)
+    except (ValueError, TypeError):
+        num = 0.0
+    sinal = "-" if num < 0 else ""
+    abs_val = abs(num)
+    parte_inteira, parte_decimal = f"{abs_val:.2f}".split(".")
+    inteira_formatada = ""
+    for i, digito in enumerate(reversed(parte_inteira)):
+        if i > 0 and i % 3 == 0:
+            inteira_formatada = "." + inteira_formatada
+        inteira_formatada = digito + inteira_formatada
+    return f"{sinal}R$ {inteira_formatada},{parte_decimal}"
+
+
+def format_num_br(valor, decimais=2):
+    """Formata número decimal no padrão brasileiro sem R$: 1.234,56"""
+    try:
+        num = float(valor or 0.0)
+    except (ValueError, TypeError):
+        num = 0.0
+    sinal = "-" if num < 0 else ""
+    abs_val = abs(num)
+    parte_inteira, parte_decimal = f"{abs_val:.{decimais}f}".split(".")
+    inteira_formatada = ""
+    for i, digito in enumerate(reversed(parte_inteira)):
+        if i > 0 and i % 3 == 0:
+            inteira_formatada = "." + inteira_formatada
+        inteira_formatada = digito + inteira_formatada
+    if decimais == 0:
+        return f"{sinal}{inteira_formatada}"
+    return f"{sinal}{inteira_formatada},{parte_decimal}"
+
+
+def parse_moeda(texto):
+    """Converte entrada com vírgula ou ponto (ex.: '1.500,50' ou '1500.50') para float."""
+    if texto is None:
+        return 0.0
+    limpo = str(texto).strip().replace("R$", "").replace("r$", "").replace(" ", "")
+    if not limpo:
+        return 0.0
+    if "," in limpo and "." in limpo:
+        limpo = limpo.replace(".", "").replace(",", ".")
+    elif "," in limpo:
+        limpo = limpo.replace(",", ".")
+    try:
+        return float(limpo)
+    except ValueError:
+        return 0.0
+
+
+def get_db_connection():
+    conn = sqlite3.connect("orcamento_obras.db")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _coluna_existe(cursor, tabela, coluna):
+    cursor.execute(f"PRAGMA table_info({tabela})")
+    return any(row["name"] == coluna for row in cursor.fetchall())
+
+
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            whatsapp TEXT NOT NULL,
+            usuario TEXT NOT NULL UNIQUE,
+            senha_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pendente',
+            vencimento TEXT,
+            criado_em TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clientes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            telefone TEXT,
+            endereco TEXT
+        )
+    """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fornecedores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            telefone TEXT,
+            material_principal TEXT,
+            tipo_fornecedor TEXT NOT NULL DEFAULT 'Material'
+        )
+    """
+    )
+    if not _coluna_existe(cursor, "fornecedores", "tipo_fornecedor"):
+        cursor.execute(
+            "ALTER TABLE fornecedores ADD COLUMN tipo_fornecedor TEXT NOT NULL DEFAULT 'Material'"
+        )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS estoque (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descricao TEXT NOT NULL,
+            fornecedor_id INTEGER,
+            unidade TEXT NOT NULL DEFAULT 'un',
+            qtd_comprada REAL NOT NULL,
+            valor_total_lote REAL NOT NULL,
+            valor_unitario REAL GENERATED ALWAYS AS (valor_total_lote / NULLIF(qtd_comprada, 0)) STORED,
+            FOREIGN KEY (fornecedor_id) REFERENCES fornecedores (id) ON DELETE SET NULL
+        )
+    """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS obras (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cliente_id INTEGER,
+            nome_obra TEXT NOT NULL,
+            valor_financiamento REAL DEFAULT 0,
+            valor_entrada REAL DEFAULT 0,
+            valor_terreno REAL DEFAULT 0,
+            metro_quadrado REAL DEFAULT 0,
+            valor_m2_usuario REAL DEFAULT 0,
+            pdf_projeto TEXT,
+            FOREIGN KEY (cliente_id) REFERENCES clientes (id) ON DELETE SET NULL
+        )
+    """
+    )
+    if not _coluna_existe(cursor, "obras", "valor_m2_usuario"):
+        cursor.execute("ALTER TABLE obras ADD COLUMN valor_m2_usuario REAL DEFAULT 0")
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS etapas_obra (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            obra_id INTEGER,
+            nome_etapa TEXT NOT NULL,
+            percentual REAL DEFAULT 0,
+            FOREIGN KEY (obra_id) REFERENCES obras (id) ON DELETE CASCADE
+        )
+    """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS materiais_obra (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            obra_id INTEGER,
+            fornecedor_id INTEGER,
+            estoque_id INTEGER,
+            categoria TEXT NOT NULL DEFAULT 'Alvenaria',
+            tipo_item TEXT NOT NULL DEFAULT 'Material',
+            descricao TEXT NOT NULL,
+            unidade TEXT NOT NULL DEFAULT 'un',
+            quantidade REAL NOT NULL,
+            valor_unitario REAL NOT NULL,
+            valor_total REAL GENERATED ALWAYS AS (quantidade * valor_unitario) STORED,
+            FOREIGN KEY (obra_id) REFERENCES obras (id) ON DELETE CASCADE,
+            FOREIGN KEY (fornecedor_id) REFERENCES fornecedores (id) ON DELETE SET NULL,
+            FOREIGN KEY (estoque_id) REFERENCES estoque (id) ON DELETE SET NULL
+        )
+    """
+    )
+    if not _coluna_existe(cursor, "materiais_obra", "categoria"):
+        cursor.execute(
+            "ALTER TABLE materiais_obra ADD COLUMN categoria TEXT NOT NULL DEFAULT 'Alvenaria'"
+        )
+    if not _coluna_existe(cursor, "materiais_obra", "tipo_item"):
+        cursor.execute(
+            "ALTER TABLE materiais_obra ADD COLUMN tipo_item TEXT NOT NULL DEFAULT 'Material'"
+        )
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+def normalizar_whatsapp(fone):
+    digitos = re.sub(r"\D", "", fone or "")
+    if not digitos:
+        return ""
+    if not digitos.startswith("55") and len(digitos) in (10, 11):
+        digitos = "55" + digitos
+    return digitos
+
+
+def montar_mensagem_cobranca(nome, vencimento):
+    venc_txt = vencimento if vencimento else "recente"
+    return (
+        f"Olá {nome}, tudo bem? Passando aqui de forma amigável para lembrar sobre a "
+        f"mensalidade do sistema (vencimento: {venc_txt}). Qualquer dúvida ou se já "
+        f"tiver realizado o pagamento, é só me avisar por aqui para mantermos seu acesso liberado!"
+    )
+
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if session.get("is_admin"):
+            return f(*args, **kwargs)
+        if not session.get("usuario_id"):
+            return redirect(url_for("login", next=request.path))
+        if session.get("status_usuario") != "ativo":
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("is_admin"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("logado"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+BASE_CSS = """
     * { box-sizing: border-box; }
     body {
         font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -190,6 +381,9 @@ BASE_CSS = '''
         display: flex;
         align-items: center;
         gap: 10px;
+    }
+    .sidebar-footer a:hover {
+        color: #feb2b2;
     }
     .main-wrapper {
         margin-left: 260px;
@@ -276,6 +470,32 @@ BASE_CSS = '''
     .card h2, .card h3 {
         color: #ffffff;
     }
+    .card-header-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        cursor: pointer;
+        user-select: none;
+    }
+    .card-header-toggle:hover h3,
+    .card-header-toggle:hover h2 {
+        color: #d4af37;
+    }
+    .toggle-arrow {
+        background: #111318;
+        color: #d4af37;
+        border: 1px solid #2d3748;
+        border-radius: 6px;
+        padding: 4px 10px;
+        font-size: 13px;
+        font-weight: bold;
+        transition: transform 0.2s, background 0.2s;
+        flex-shrink: 0;
+    }
+    .collapsible-body.collapsed {
+        display: none;
+    }
     table {
         width: 100%;
         border-collapse: collapse;
@@ -335,6 +555,11 @@ BASE_CSS = '''
         font-size: 12px;
         text-decoration: none;
         font-weight: 600;
+        border: none;
+        cursor: pointer;
+        display: inline-block;
+        margin-right: 4px;
+        margin-bottom: 4px;
     }
     .btn-detalhe:hover {
         background: #4a5568;
@@ -347,6 +572,8 @@ BASE_CSS = '''
         font-size: 12px;
         text-decoration: none;
         font-weight: 600;
+        display: inline-block;
+        margin-bottom: 4px;
     }
     .btn-excluir:hover {
         background: rgba(231, 76, 60, 0.3);
@@ -397,8 +624,40 @@ BASE_CSS = '''
         border-top: 1px solid #2d3748;
         margin: 15px 0;
     }
+    .badge-tipo {
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+    }
+    .badge-mat {
+        background: rgba(99, 179, 237, 0.18);
+        color: #63b3ed;
+    }
+    .badge-mo {
+        background: rgba(212, 175, 55, 0.2);
+        color: #d4af37;
+    }
+    .login-container {
+        min-height: 100vh;
+        width: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        background: #0f1115;
+    }
+    .login-box {
+        width: 100%;
+        max-width: 400px;
+        background: #1a1e29;
+        border: 1px solid #2d3748;
+        border-top: 4px solid #d4af37;
+        border-radius: 8px;
+        padding: 30px 25px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
 
-    /* RESPONSIVIDADE TOTAL PARA TELEMÓVEIS (Abaixo de 768px) */
     @media (max-width: 768px) {
         .sidebar {
             width: 100%;
@@ -408,6 +667,7 @@ BASE_CSS = '''
         }
         .sidebar-header {
             padding: 12px 15px;
+            justify-content: space-between;
         }
         .sidebar-header img {
             width: 32px;
@@ -415,6 +675,13 @@ BASE_CSS = '''
         }
         .sidebar-header h2 {
             font-size: 12px;
+        }
+        .mobile-logout-link {
+            display: inline-block !important;
+            color: #fc8181;
+            font-size: 12px;
+            font-weight: 600;
+            text-decoration: none;
         }
         .sidebar-menu {
             display: flex;
@@ -443,7 +710,7 @@ BASE_CSS = '''
             width: 100%;
         }
         .top-navbar {
-            display: none; /* Oculta a barra superior duplicada no mobile */
+            display: none;
         }
         .content-area {
             padding: 15px 12px;
@@ -459,41 +726,86 @@ BASE_CSS = '''
             font-size: 20px !important;
         }
     }
-'''
-
-def render_layout(body_content, active_menu='resumo'):
-    menu_active = {
-        'resumo': '', 'clientes': '', 'obra': '', 'fornecedores': '', 'estoque': ''
+    .mobile-logout-link {
+        display: none;
     }
-    menu_active[active_menu] = 'active'
-    
-    return render_template_string(f'''
+"""
+
+TOGGLE_SCRIPT = """
+<script>
+function toggleSection(headerEl, targetId) {
+    const bodyEl = document.getElementById(targetId);
+    const arrowEl = headerEl.querySelector('.toggle-arrow');
+    if (!bodyEl) return;
+    const isCollapsed = bodyEl.classList.toggle('collapsed');
+    if (arrowEl) {
+        arrowEl.textContent = isCollapsed ? '▸ Abrir' : '▾ Fechar';
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+    document.querySelectorAll('.collapsible-body').forEach(function (el) {
+        el.classList.add('collapsed');
+        const header = el.previousElementSibling;
+        if (header && header.classList.contains('card-header-toggle')) {
+            const arrow = header.querySelector('.toggle-arrow');
+            if (arrow) arrow.textContent = '▸ Abrir';
+        }
+    });
+});
+</script>
+"""
+
+
+def render_layout(body_content, active_menu="resumo"):
+    menu_active = {
+        "resumo": "",
+        "clientes": "",
+        "obra": "",
+        "fornecedores": "",
+        "estoque": "",
+    }
+    if active_menu in menu_active:
+        menu_active[active_menu] = "active"
+
+    admin_link = (
+        '<li><a href="/admin">🛡️ <span>Admin</span></a></li>'
+        if session.get("is_admin")
+        else ""
+    )
+
+    return render_template_string(
+        f"""
         <!DOCTYPE html>
-        <html lang="pt">
+        <html lang="pt-br">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Construtora Quality - Painel de Engenharia</title>
-            <style>'''+ BASE_CSS +'''</style>
+            <style>{BASE_CSS}</style>
         </head>
         <body>
             <div class="sidebar">
                 <div class="sidebar-header">
-                    <img src="/static/logo.jpg" alt="Logo">
-                    <h2>CONSTRUTORA QUALITY</h2>
+                    <div style="display:flex; align-items:center; gap:12px;">
+                        <img src="/static/logo.jpg" alt="Logo">
+                        <h2>CONSTRUTORA QUALITY</h2>
+                    </div>
+                    <a href="/logout" class="mobile-logout-link">Sair</a>
                 </div>
                 <ul class="sidebar-menu">
                     <li><a href="/" class="{menu_active['resumo']}">📊 <span>Resumo</span></a></li>
                     <li><a href="/novo_cliente" class="{menu_active['clientes']}">👤 <span>Clientes</span></a></li>
                     <li><a href="/nova_obra" class="{menu_active['obra']}">🏗️ <span>Registar</span></a></li>
                     <li><a href="/fornecedores" class="{menu_active['fornecedores']}">🤝 <span>Fornecedores</span></a></li>
-                    <li><a href="/estoque" class="{menu_active['estoque']}">📦 <span>Stock</span></a></li>
+                    <li><a href="/estoque" class="{menu_active['estoque']}">📦 <span>Estoque</span></a></li>
+                    {admin_link}
                 </ul>
                 <div class="sidebar-footer">
-                    <a href="/">🚪 Sair do Sistema</a>
+                    <a href="/logout">🚪 Sair do Sistema</a>
                 </div>
             </div>
-            
+
             <div class="main-wrapper">
                 <div class="top-navbar">
                     <span style="font-weight: 600; font-size: 13px; letter-spacing: 0.5px; color: #d4af37;">GESTÃO DE OBRAS</span>
@@ -502,95 +814,431 @@ def render_layout(body_content, active_menu='resumo'):
                     </div>
                 </div>
                 <div class="content-area">
-                    '''+ body_content +'''
+                    {body_content}
                 </div>
             </div>
+            {TOGGLE_SCRIPT}
         </body>
         </html>
-    ''')
+    """
+    )
 
-def render_layout(body_content, active_menu='resumo'):
-    menu_active = {
-        'resumo': '', 'clientes': '', 'obra': '', 'fornecedores': '', 'estoque': ''
-    }
-    menu_active[active_menu] = 'active'
-    
-    return render_template_string(f'''
+@app.route("/cadastro", methods=["GET", "POST"])
+def cadastro():
+    mensagem = ""
+    erro = ""
+
+    if request.method == "POST":
+        nome = (request.form.get("nome") or "").strip()
+        whatsapp = (request.form.get("whatsapp") or "").strip()
+        usuario = (request.form.get("usuario") or "").strip().lower()
+        senha = request.form.get("senha") or ""
+
+        if not nome or not whatsapp or not usuario or not senha:
+            erro = "Preencha nome, WhatsApp, usuário e senha."
+        elif usuario == ADMIN_USER.lower():
+            erro = "Esse nome de usuário não está disponível."
+        else:
+            conn = get_db_connection()
+            existente = conn.execute(
+                "SELECT id FROM usuarios WHERE usuario = ?", (usuario,)
+            ).fetchone()
+            if existente:
+                conn.close()
+                erro = "Este usuário já está cadastrado."
+            else:
+                venc_padrao = (date.today() + timedelta(days=30)).strftime("%Y-%m-%d")
+                conn.execute(
+                    """
+                    INSERT INTO usuarios (nome, whatsapp, usuario, senha_hash, status, vencimento)
+                    VALUES (?, ?, ?, ?, 'pendente', ?)
+                """,
+                    (nome, whatsapp, usuario, generate_password_hash(senha), venc_padrao),
+                )
+                conn.commit()
+                conn.close()
+                mensagem = (
+                    "Cadastro realizado com sucesso! Seu acesso está em análise e "
+                    "aguardando liberação do administrador."
+                )
+
+    alerta_html = ""
+    if erro:
+        alerta_html = f'<div style="background:rgba(231,76,60,0.18); color:#fc8181; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{erro}</div>'
+    elif mensagem:
+        alerta_html = f'<div style="background:rgba(72,187,120,0.18); color:#68d391; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{mensagem}</div>'
+
+    return render_template_string(
+        f"""
         <!DOCTYPE html>
-        <html lang="pt">
+        <html lang="pt-br">
         <head>
             <meta charset="UTF-8">
-            <title>Construtora Quality - Painel de Engenharia</title>
-            <style>'''+ BASE_CSS +'''</style>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Cadastro - Construtora Quality</title>
+            <style>{BASE_CSS}</style>
         </head>
         <body>
-            <div class="sidebar">
-                <div class="sidebar-header">
-                    <img src="/static/logo.jpg" alt="Logo">
-                    <h2>CONSTRUTORA QUALITY</h2>
-                </div>
-                <ul class="sidebar-menu">
-                    <li><a href="/" class="{menu_active['resumo']}">📊 Resumo Geral</a></li>
-                    <li><a href="/novo_cliente" class="{menu_active['clientes']}">👤 Clientes</a></li>
-                    <li><a href="/nova_obra" class="{menu_active['obra']}">🏗️ Registar Obra</a></li>
-                    <li><a href="/fornecedores" class="{menu_active['fornecedores']}">🤝 Fornecedores</a></li>
-                    <li><a href="/estoque" class="{menu_active['estoque']}">📦 Estoque / Lotes</a></li>
-                </ul>
-                <div class="sidebar-footer">
-                    <a href="/">🚪 Sair do Sistema</a>
-                </div>
-            </div>
-            
-            <div class="main-wrapper">
-                <div class="top-navbar">
-                    <span style="font-weight: 600; font-size: 14px; letter-spacing: 0.5px; color: #d4af37;">PAINEL DE GESTÃO DE OBRAS</span>
-                    <div class="user-info">
-                        <span>Construtora Quality ▾</span>
+            <div class="login-container">
+                <div class="login-box">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:20px; border-bottom:1px solid #2d3748; padding-bottom:15px;">
+                        <img src="/static/logo.jpg" alt="Logo" style="width:44px; height:44px; border-radius:6px; object-fit:cover; border:1px solid #d4af37;">
+                        <div>
+                            <h2 style="margin:0; font-size:16px; color:#d4af37;">SOLICITAR ACESSO</h2>
+                            <span style="font-size:12px; color:#a0aec0;">Cadastro de Profissional</span>
+                        </div>
                     </div>
-                </div>
-                <div class="content-area">
-                    '''+ body_content +'''
+                    {alerta_html}
+                    <form method="POST">
+                        <label style="font-size:13px; color:#cbd5e0;">Nome Completo:</label>
+                        <input type="text" name="nome" required>
+
+                        <label style="font-size:13px; color:#cbd5e0;">WhatsApp (com DDD):</label>
+                        <input type="text" name="whatsapp" placeholder="Ex: (17) 99999-9999" required>
+
+                        <label style="font-size:13px; color:#cbd5e0;">Usuário de Acesso:</label>
+                        <input type="text" name="usuario" autocomplete="username" required>
+
+                        <label style="font-size:13px; color:#cbd5e0;">Senha:</label>
+                        <input type="password" name="senha" autocomplete="new-password" required>
+
+                        <button type="submit" class="btn" style="width:100%; margin-top:8px;">Cadastrar e Enviar para Análise</button>
+                    </form>
+                    <div style="margin-top:16px; text-align:center; font-size:13px;">
+                        <a href="/login" style="color:#d4af37; text-decoration:none;">Já tem cadastro? Fazer Login</a>
+                    </div>
                 </div>
             </div>
         </body>
         </html>
-    ''')
+    """
+    )
 
-@app.route('/')
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    aviso = ""
+    tipo_aviso = "erro"
+    proximo = request.args.get("next") or request.form.get("next") or url_for("index")
+    if not proximo.startswith("/"):
+        proximo = url_for("index")
+
+    if request.method == "POST":
+        usuario = (request.form.get("usuario") or "").strip().lower()
+        senha = request.form.get("senha") or ""
+
+        if usuario == ADMIN_USER.lower() and senha == ADMIN_PASS:
+            session.clear()
+            session["logado"] = True
+            session["is_admin"] = True
+            session["usuario"] = ADMIN_USER
+            session["status_usuario"] = "ativo"
+            return redirect(url_for("admin_painel"))
+
+        conn = get_db_connection()
+        user_row = conn.execute(
+            "SELECT * FROM usuarios WHERE usuario = ?", (usuario,)
+        ).fetchone()
+        conn.close()
+
+        if user_row and check_password_hash(user_row["senha_hash"], senha):
+            status = (user_row["status"] or "pendente").lower()
+            if status == "ativo":
+                session.clear()
+                session["logado"] = True
+                session["is_admin"] = False
+                session["usuario_id"] = user_row["id"]
+                session["usuario"] = user_row["usuario"]
+                session["nome_usuario"] = user_row["nome"]
+                session["status_usuario"] = "ativo"
+                return redirect(proximo)
+            elif status == "pendente":
+                aviso = "Seu cadastro está em análise e aguardando a liberação do administrador."
+                tipo_aviso = "alerta"
+            elif status == "bloqueado":
+                aviso = "Acesso trancado por pendência na mensalidade. Entre em contato para regularizar."
+                tipo_aviso = "erro"
+            else:
+                aviso = "Acesso indisponível no momento."
+                tipo_aviso = "erro"
+        else:
+            aviso = "Usuário ou senha inválidos."
+            tipo_aviso = "erro"
+
+    aviso_html = ""
+    if aviso:
+        if tipo_aviso == "alerta":
+            aviso_html = f'<div style="background:rgba(212,175,55,0.18); color:#f6e05e; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{aviso}</div>'
+        else:
+            aviso_html = f'<div style="background:rgba(231,76,60,0.18); color:#fc8181; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{aviso}</div>'
+
+    return render_template_string(
+        f"""
+        <!DOCTYPE html>
+        <html lang="pt-br">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Login - Construtora Quality</title>
+            <style>{BASE_CSS}</style>
+        </head>
+        <body>
+            <div class="login-container">
+                <div class="login-box">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:20px; border-bottom:1px solid #2d3748; padding-bottom:15px;">
+                        <img src="/static/logo.jpg" alt="Logo" style="width:44px; height:44px; border-radius:6px; object-fit:cover; border:1px solid #d4af37;">
+                        <div>
+                            <h2 style="margin:0; font-size:16px; color:#d4af37;">CONSTRUTORA QUALITY</h2>
+                            <span style="font-size:12px; color:#a0aec0;">Acesso ao Painel de Gestão</span>
+                        </div>
+                    </div>
+                    {aviso_html}
+                    <form method="POST">
+                        <input type="hidden" name="next" value="{proximo}">
+                        <label style="font-size:13px; color:#cbd5e0;">Usuário:</label>
+                        <input type="text" name="usuario" autocomplete="username" required>
+                        <label style="font-size:13px; color:#cbd5e0;">Senha:</label>
+                        <input type="password" name="senha" autocomplete="current-password" required>
+                        <button type="submit" class="btn" style="width:100%; margin-top:8px;">Entrar</button>
+                    </form>
+                    <div style="margin-top:16px; text-align:center; font-size:13px;">
+                        <a href="/cadastro" style="color:#d4af37; text-decoration:none;">Novo profissional? Solicitar cadastro</a>
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+    """
+    )
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/admin", methods=["GET", "POST"])
+@admin_required
+def admin_painel():
+    conn = get_db_connection()
+
+    if request.method == "POST":
+        acao = request.form.get("acao")
+        user_id = request.form.get("user_id")
+        if user_id:
+            if acao == "liberar":
+                conn.execute(
+                    "UPDATE usuarios SET status = 'ativo' WHERE id = ?", (user_id,)
+                )
+            elif acao == "trancar":
+                conn.execute(
+                    "UPDATE usuarios SET status = 'bloqueado' WHERE id = ?", (user_id,)
+                )
+            elif acao == "salvar_vencimento":
+                novo_venc = (request.form.get("vencimento") or "").strip()
+                conn.execute(
+                    "UPDATE usuarios SET vencimento = ? WHERE id = ?",
+                    (novo_venc, user_id),
+                )
+            conn.commit()
+        conn.close()
+        return redirect(url_for("admin_painel"))
+
+    usuarios = conn.execute("SELECT * FROM usuarios ORDER BY id DESC").fetchall()
+    conn.close()
+
+    rows_html = ""
+    if usuarios:
+        for u in usuarios:
+            st = (u["status"] or "pendente").lower()
+            if st == "ativo":
+                badge = '<span style="color:#48bb78; font-weight:700;">Ativo</span>'
+            elif st == "bloqueado":
+                badge = '<span style="color:#fc8181; font-weight:700;">Trancado</span>'
+            else:
+                badge = '<span style="color:#f6e05e; font-weight:700;">Em Análise</span>'
+
+            msg_cobranca = montar_mensagem_cobranca(u["nome"], u["vencimento"])
+            msg_escapada = (
+                msg_cobranca.replace("\\", "\\\\")
+                .replace("'", "\\'")
+                .replace("\n", "\\n")
+            )
+            fone_wa = normalizar_whatsapp(u["whatsapp"])
+            wa_link = (
+                f"https://wa.me/{fone_wa}?text={msg_cobranca.replace(' ', '%20')}"
+                if fone_wa
+                else "#"
+            )
+
+            rows_html += f"""
+                <tr>
+                    <td><strong style="color:#fff;">{u["nome"]}</strong><br><span style="font-size:11px; color:#a0aec0;">@{u["usuario"]}</span></td>
+                    <td>{u["whatsapp"]}</td>
+                    <td>{badge}</td>
+                    <td>
+                        <form method="post" style="display:flex; gap:6px; align-items:center; margin:0;">
+                            <input type="hidden" name="acao" value="salvar_vencimento">
+                            <input type="hidden" name="user_id" value="{u["id"]}">
+                            <input type="date" name="vencimento" value="{u["vencimento"] or ""}" style="width:140px; margin:0; padding:5px; font-size:12px;">
+                            <button type="submit" class="btn-detalhe">Salvar</button>
+                        </form>
+                    </td>
+                    <td>
+                        <form method="post" style="display:inline; margin:0;">
+                            <input type="hidden" name="acao" value="liberar">
+                            <input type="hidden" name="user_id" value="{u["id"]}">
+                            <button type="submit" class="btn-detalhe" style="color:#48bb78;">Liberar</button>
+                        </form>
+                        <form method="post" style="display:inline; margin:0;">
+                            <input type="hidden" name="acao" value="trancar">
+                            <input type="hidden" name="user_id" value="{u["id"]}">
+                            <button type="submit" class="btn-excluir">Trancar</button>
+                        </form>
+                        <button type="button" class="btn-detalhe" style="color:#d4af37;" onclick="prepararCobranca('{u["nome"]}', '{msg_escapada}', '{wa_link}')">
+                            Cobrança WA
+                        </button>
+                    </td>
+                </tr>
+            """
+    else:
+        rows_html = '<tr><td colspan="5" style="text-align:center; color:#a0aec0;">Nenhum profissional cadastrado ainda.</td></tr>'
+
+    body = f"""
+        <a href="/" class="voltar">← Voltar para o Início</a>
+        <div class="top-bar-title">
+            <div>
+                <h1>Painel do Administrador</h1>
+                <p>Controle de acessos, mensalidades e mensagens amigáveis de cobrança.</p>
+            </div>
+        </div>
+
+        <div class="card" id="box-cobranca" style="display:none; border-left: 5px solid #d4af37;">
+            <h3 style="margin-top:0;">Mensagem Amigável de Cobrança (<span id="cob-nome"></span>)</h3>
+            <textarea id="cob-texto" rows="4" style="width:100%; background:#111318; color:#fff; border:1px solid #2d3748; border-radius:6px; padding:10px; font-size:13px;"></textarea>
+            <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:12px;">
+                <button type="button" class="btn" onclick="copiarCobranca()">Copiar Mensagem</button>
+                <a id="cob-wa-link" href="#" target="_blank" class="btn btn-secundario">Abrir no WhatsApp</a>
+                <button type="button" class="btn-detalhe" onclick="document.getElementById('box-cobranca').style.display='none'">Fechar</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3 style="margin-top:0;">Profissionais Cadastrados</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Profissional</th>
+                        <th>WhatsApp</th>
+                        <th>Status</th>
+                        <th>Vencimento</th>
+                        <th>Ações</th>
+                    </tr>
+                </thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+        </div>
+
+        <script>
+        function prepararCobranca(nome, msg, waLink) {{
+            document.getElementById('cob-nome').textContent = nome;
+            document.getElementById('cob-texto').value = msg;
+            const linkEl = document.getElementById('cob-wa-link');
+            linkEl.href = waLink;
+            linkEl.style.display = waLink && waLink !== '#' ? 'inline-block' : 'none';
+            const box = document.getElementById('box-cobranca');
+            box.style.display = 'block';
+            box.scrollIntoView({{ behavior: 'smooth' }});
+        }}
+
+        function copiarCobranca() {{
+            const txt = document.getElementById('cob-texto');
+            txt.select();
+            document.execCommand('copy');
+            alert('Mensagem copiada! Agora é só colar e enviar no WhatsApp.');
+        }}
+        </script>
+    """
+    return render_layout(body, active_menu="resumo")
+
+    
+
+
+@app.route("/")
+@login_required
 def index():
     conn = get_db_connection()
-    obras_cursor = conn.execute('''
-        SELECT obras.*, clientes.nome as cliente_nome 
-        FROM obras 
+    obras_cursor = conn.execute(
+        """
+        SELECT obras.*, clientes.nome as cliente_nome
+        FROM obras
         LEFT JOIN clientes ON obras.cliente_id = clientes.id
-    ''').fetchall()
-    
+        ORDER BY obras.id DESC
+    """
+    ).fetchall()
+
     obras = []
-    total_custo_geral = 0
+    total_custo_geral = 0.0
+    lucro_geral_obras = 0.0
+
     for o in obras_cursor:
         obra_dict = dict(o)
-        etapas = conn.execute('SELECT percentual FROM etapas_obra WHERE obra_id = ?', (o['id'],)).fetchall()
-        if etapas:
-            media_progresso = sum(e['percentual'] for e in etapas) / len(etapas)
-        else:
-            media_progresso = 0.0
-        obra_dict['progresso_medio'] = media_progresso
-        
-        materiais = conn.execute('SELECT SUM(valor_total) as total FROM materiais_obra WHERE obra_id = ?', (o['id'],)).fetchone()['total'] or 0
-        custo_obra = materiais + (o['valor_terreno'] or 0)
+        mat_row = conn.execute(
+            "SELECT SUM(valor_total) as total FROM materiais_obra WHERE obra_id = ?",
+            (o["id"],),
+        ).fetchone()
+        custo_materiais = float(mat_row["total"] or 0.0)
+        terreno = float(o["valor_terreno"] or 0.0)
+        financiamento = float(o["valor_financiamento"] or 0.0)
+        entrada = float(o["valor_entrada"] or 0.0)
+
+        custo_obra = custo_materiais + terreno
+        receita_obra = financiamento + entrada
+        lucro_obra = receita_obra - custo_obra
+
+        obra_dict["custo_obra"] = custo_obra
+        obra_dict["lucro_obra"] = lucro_obra
+
         total_custo_geral += custo_obra
-        
+        lucro_geral_obras += lucro_obra
         obras.append(obra_dict)
-        
+
     total_obras = len(obras)
-    progresso_geral_medio = (sum(o['progresso_medio'] for o in obras) / total_obras) if total_obras > 0 else 0.0
     conn.close()
-    
-    body = f'''
+
+    lucro_cor = "#48bb78" if lucro_geral_obras >= 0 else "#fc8181"
+
+    linhas_html = ""
+    if obras:
+        for obra in obras:
+            if obra["pdf_projeto"]:
+                pdf_link = f'<a href="/uploads/{obra["pdf_projeto"]}" target="_blank" style="color: #d4af37; font-weight: bold;">Ver PDF</a>'
+            else:
+                pdf_link = '<span style="color: #718096;">Sem Projeto</span>'
+
+            lucro_item_cor = "#48bb78" if obra["lucro_obra"] >= 0 else "#fc8181"
+            linhas_html += f"""
+                <tr>
+                    <td>{obra["id"]:02d}</td>
+                    <td><strong style="color: #ffffff;">{obra["nome_obra"]}</strong></td>
+                    <td>{obra["cliente_nome"] or "Sem Cliente"}</td>
+                    <td>{format_brl(obra["valor_financiamento"])}</td>
+                    <td>{format_num_br(obra["metro_quadrado"], 2)} m²</td>
+                    <td style="color: {lucro_item_cor}; font-weight: 600;">{format_brl(obra["lucro_obra"])}</td>
+                    <td>{pdf_link}</td>
+                    <td>
+                        <a href="/obra/{obra["id"]}" class="btn-detalhe">Orçamento</a>
+                        <a href="/editar_obra/{obra["id"]}" class="btn-detalhe" style="color: #d4af37;">Editar</a>
+                        <a href="/excluir_obra/{obra["id"]}" class="btn-excluir" onclick="return confirm('Deseja excluir esta obra?')">Excluir</a>
+                    </td>
+                </tr>
+            """
+    else:
+        linhas_html = '<tr><td colspan="8" style="text-align: center; color: #a0aec0;">Nenhuma obra registada até o momento.</td></tr>'
+
+    body = f"""
         <div class="top-bar-title">
             <div>
                 <h1>Resumo Geral das Obras</h1>
-                <p>Acompanhamento financeiro, físico e orçamental das construções.</p>
+                <p>Acompanhamento financeiro e orçamental das construções.</p>
             </div>
             <div>
                 <a href="/nova_obra" class="btn">+ Registar Obra</a>
@@ -604,515 +1252,1200 @@ def index():
             </div>
             <div class="metric-card">
                 <h4>Orçamento Total Gasto</h4>
-                <div class="value" style="color: #48bb78;">R$ {total_custo_geral:,.2f}</div>
+                <div class="value" style="color: #48bb78;">{format_brl(total_custo_geral)}</div>
             </div>
             <div class="metric-card">
-                <h4>Progresso Médio Geral</h4>
-                <div class="value" style="color: #63b3ed;">{progresso_geral_medio:.1f}%</div>
+                <h4>Lucro Geral das Obras</h4>
+                <div class="value" style="color: {lucro_cor};">{format_brl(lucro_geral_obras)}</div>
             </div>
         </div>
 
         <div class="card">
-            <h3 style="margin-top: 0; margin-bottom: 15px; font-size: 16px;">Lista de Obras em Andamento</h3>
-            <table>
-                <tr>
-                    <th>ID</th>
-                    <th>Nome da Obra</th>
-                    <th>Cliente</th>
-                    <th>Financiamento</th>
-                    <th>Área (m²)</th>
-                    <th>% Executado</th>
-                    <th>Projeto PDF</th>
-                    <th>Ações</th>
-                </tr>
-    '''
-    
-    if obras:
-        for obra in obras:
-            pdf_link = f'<a href="/uploads/{obra["pdf_projeto"]}" target="_blank" style="color: #d4af37; font-weight: bold;">Ver PDF</a>' if obra['pdf_projeto'] else '<span style="color: #718096;">Sem Projeto</span>'
-            body += f'''
-                <tr>
-                    <td>{obra["id"]:02d}</td>
-                    <td><strong style="color: #ffffff;">{obra["nome_obra"]}</strong></td>
-                    <td>{obra["cliente_nome"] or "Sem Cliente"}</td>
-                    <td>R$ {obra["valor_financiamento"]:,.2f}</td>
-                    <td>{obra["metro_quadrado"]} m²</td>
-                    <td>
-                        <div class="progress-bar-container"><div class="progress-bar-fill" style="width: {obra["progresso_medio"]}%;"></div></div>
-                        <strong style="color: #63b3ed;">{obra["progresso_medio"]:.1f}%</strong>
-                    </td>
-                    <td>{pdf_link}</td>
-                    <td>
-                        <a href="/obra/{obra["id"]}" class="btn-detalhe">Orçamento</a>
-                        <a href="/excluir_obra/{obra["id"]}" class="btn-excluir" onclick="return confirm('Deseja excluir esta obra?')">Excluir</a>
-                    </td>
-                </tr>
-            '''
-    else:
-        body += '<tr><td colspan="8" style="text-align: center; color: #a0aec0;">Nenhuma obra registada até o momento.</td></tr>'
-
-    body += '''
-            </table>
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-obras-lista')">
+                <h3 style="margin: 0; font-size: 16px;">Lista de Obras em Andamento</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-obras-lista" class="collapsible-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Nome da Obra</th>
+                            <th>Cliente</th>
+                            <th>Financiamento</th>
+                            <th>Área (m²)</th>
+                            <th>Lucro da Obra</th>
+                            <th>Projeto PDF</th>
+                            <th>Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {linhas_html}
+                    </tbody>
+                </table>
+            </div>
         </div>
-    '''
-    return render_layout(body, active_menu='resumo')
+    """
+    return render_layout(body, active_menu="resumo")
 
-@app.route('/novo_cliente', methods=('GET', 'POST'))
+
+@app.route("/novo_cliente", methods=["GET", "POST"])
+@login_required
 def novo_cliente():
-    if request.method == 'POST':
-        nome = request.form['nome']
-        telefone = request.form['telefone']
-        endereco = request.form['endereco']
-        
-        conn = get_db_connection()
-        conn.execute('INSERT INTO clientes (nome, telefone, endereco) VALUES (?, ?, ?)',
-                     (nome, telefone, endereco))
-        conn.commit()
-        conn.close()
-        return redirect(url_for('index'))
-        
-    body = '''
-        <a href="/" class="voltar">← Voltar para o Início</a>
-        <div class="card" style="max-width: 550px;">
-            <h2>Registar Novo Cliente</h2>
-            <form method="post" style="margin-top: 15px;">
-                <p>Nome:<br><input type="text" name="nome" autocomplete="off" required style="width: 100%;"></p>
-                <p>Telefone:<br><input type="text" name="telefone" autocomplete="off" style="width: 100%;"></p>
-                <p>Endereço:<br><input type="text" name="endereco" autocomplete="off" style="width: 100%;"></p>
-                <button type="submit" class="btn" style="width: 100%; margin-top: 10px;">Salvar Cliente</button>
-            </form>
-        </div>
-    '''
-    return render_layout(body, active_menu='clientes')
-
-@app.route('/nova_obra', methods=('GET', 'POST'))
-def nova_obra():
     conn = get_db_connection()
-    if request.method == 'POST':
-        cliente_id = request.form['cliente_id']
-        nome_obra = request.form['nome_obra']
-        valor_financiamento = float(request.form['valor_financiamento'] or 0.0)
-        valor_entrada = float(request.form['valor_entrada'] or 0.0)
-        valor_terreno = float(request.form['valor_terreno'] or 0.0)
-        metro_quadrado = float(request.form['metro_quadrado'] or 0.0)
-        
-        pdf_filename = None
-        if 'pdf_projeto' in request.files:
-            file = request.files['pdf_projeto']
-            if file and file.filename.endswith('.pdf'):
-                pdf_filename = file.filename
-                file.save(os.path.join(app.config['UPLOAD_FOLDER'], pdf_filename))
-        
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO obras (cliente_id, nome_obra, valor_financiamento, valor_entrada, valor_terreno, metro_quadrado, pdf_projeto)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (cliente_id, nome_obra, valor_financiamento, valor_entrada, valor_terreno, metro_quadrado, pdf_filename))
-        obra_id = cursor.lastrowid
-        
-        for etapa in ETAPAS_PADRAO:
-            conn.execute('INSERT INTO etapas_obra (obra_id, nome_etapa, percentual) VALUES (?, ?, 0)', (obra_id, etapa))
-            
+    if request.method == "POST":
+        nome = request.form["nome"].strip()
+        telefone = request.form["telefone"].strip()
+        endereco = request.form["endereco"].strip()
+
+        conn.execute(
+            "INSERT INTO clientes (nome, telefone, endereco) VALUES (?, ?, ?)",
+            (nome, telefone, endereco),
+        )
         conn.commit()
         conn.close()
-        return redirect(url_for('index'))
-        
-    clientes = conn.execute('SELECT * FROM clientes').fetchall()
+        return redirect(url_for("novo_cliente"))
+
+    clientes = conn.execute("SELECT * FROM clientes ORDER BY id DESC").fetchall()
     conn.close()
-    
-    options = "".join([f'<option value="{c["id"]}">{c["nome"]}</option>' for c in clientes])
-    
-    body = f'''
+
+    cli_rows = ""
+    if clientes:
+        for c in clientes:
+            cli_rows += f"""
+                <tr>
+                    <td><strong style="color:#fff;">{c["nome"]}</strong></td>
+                    <td>{c["telefone"] or "-"}</td>
+                    <td>{c["endereco"] or "-"}</td>
+                </tr>
+            """
+    else:
+        cli_rows = '<tr><td colspan="3" style="text-align:center; color:#a0aec0;">Nenhum cliente registado.</td></tr>'
+
+    body = f"""
         <a href="/" class="voltar">← Voltar para o Início</a>
         <div class="card" style="max-width: 650px;">
-            <h2>Registar Nova Obra</h2>
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-form-cliente')">
+                <h2 style="margin:0;">Registar Novo Cliente</h2>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-form-cliente" class="collapsible-body">
+                <form method="post" style="margin-top: 15px;">
+                    <label>Nome:</label>
+                    <input type="text" name="nome" autocomplete="off" required>
+                    <label>Telefone:</label>
+                    <input type="text" name="telefone" autocomplete="off">
+                    <label>Endereço:</label>
+                    <input type="text" name="endereco" autocomplete="off">
+                    <button type="submit" class="btn" style="width: 100%; margin-top: 10px;">Salvar Cliente</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-lista-clientes')">
+                <h3 style="margin:0;">Clientes Cadastrados</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-lista-clientes" class="collapsible-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Nome</th>
+                            <th>Telefone</th>
+                            <th>Endereço</th>
+                        </tr>
+                    </thead>
+                    <tbody>{cli_rows}</tbody>
+                </table>
+            </div>
+        </div>
+    """
+    return render_layout(body, active_menu="clientes")
+
+
+@app.route("/nova_obra", methods=["GET", "POST"])
+@login_required
+def nova_obra():
+    conn = get_db_connection()
+    if request.method == "POST":
+        cliente_id = request.form.get("cliente_id") or None
+        nome_obra = request.form["nome_obra"].strip()
+        valor_financiamento = parse_moeda(request.form.get("valor_financiamento"))
+        valor_entrada = parse_moeda(request.form.get("valor_entrada"))
+        valor_terreno = parse_moeda(request.form.get("valor_terreno"))
+        metro_quadrado = parse_moeda(request.form.get("metro_quadrado"))
+        valor_m2_usuario = parse_moeda(request.form.get("valor_m2_usuario"))
+
+        pdf_filename = None
+        if "pdf_projeto" in request.files:
+            file = request.files["pdf_projeto"]
+            if file and file.filename and file.filename.lower().endswith(".pdf"):
+                safe_name = os.path.basename(file.filename)
+                pdf_filename = safe_name
+                file.save(os.path.join(app.config["UPLOAD_FOLDER"], pdf_filename))
+
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO obras (
+                cliente_id, nome_obra, valor_financiamento, valor_entrada,
+                valor_terreno, metro_quadrado, valor_m2_usuario, pdf_projeto
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                cliente_id,
+                nome_obra,
+                valor_financiamento,
+                valor_entrada,
+                valor_terreno,
+                metro_quadrado,
+                valor_m2_usuario,
+                pdf_filename,
+            ),
+        )
+        obra_id = cursor.lastrowid
+
+        for etapa in ETAPAS_PADRAO:
+            conn.execute(
+                "INSERT INTO etapas_obra (obra_id, nome_etapa, percentual) VALUES (?, ?, 0)",
+                (obra_id, etapa),
+            )
+
+        conn.commit()
+        conn.close()
+        return redirect(url_for("index"))
+
+    clientes = conn.execute("SELECT * FROM clientes ORDER BY nome").fetchall()
+    conn.close()
+
+    options = "".join(
+        [f'<option value="{c["id"]}">{c["nome"]}</option>' for c in clientes]
+    )
+
+    body = f"""
+        <a href="/" class="voltar">← Voltar para o Início</a>
+        <div class="card" style="max-width: 650px;">
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-nova-obra')">
+                <h2 style="margin:0;">Registar Nova Obra</h2>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-nova-obra" class="collapsible-body">
+                <form method="post" enctype="multipart/form-data" style="margin-top: 15px;">
+                    <label>Cliente:</label>
+                    <select name="cliente_id" required>
+                        <option value="">Selecione um cliente</option>
+                        {options}
+                    </select>
+
+                    <label>Nome da Obra:</label>
+                    <input type="text" name="nome_obra" autocomplete="off" required>
+
+                    <label>Valor Financiamento (R$):</label>
+                    <input type="text" name="valor_financiamento" placeholder="Ex: 250000,00" autocomplete="off">
+
+                    <label>Valor Entrada (R$):</label>
+                    <input type="text" name="valor_entrada" placeholder="Ex: 50000,00" autocomplete="off">
+
+                    <label>Valor do Terreno (R$):</label>
+                    <input type="text" name="valor_terreno" placeholder="Ex: 80000,00" autocomplete="off">
+
+                    <label>Área da Casa (m²):</label>
+                    <input type="text" name="metro_quadrado" placeholder="Ex: 120,50" autocomplete="off">
+
+                    <label>Valor por m² de Referência (R$/m²):</label>
+                    <input type="text" name="valor_m2_usuario" placeholder="Ex: 2800,00" autocomplete="off">
+
+                    <label>Projeto (PDF):</label>
+                    <input type="file" name="pdf_projeto" accept=".pdf">
+
+                    <button type="submit" class="btn" style="width: 100%; margin-top: 10px;">Salvar Obra</button>
+                </form>
+            </div>
+        </div>
+    """
+    return render_layout(body, active_menu="obra")
+
+
+@app.route("/editar_obra/<int:obra_id>", methods=["GET", "POST"])
+@login_required
+def editar_obra(obra_id):
+    conn = get_db_connection()
+    obra = conn.execute("SELECT * FROM obras WHERE id = ?", (obra_id,)).fetchone()
+    if not obra:
+        conn.close()
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        cliente_id = request.form.get("cliente_id") or None
+        nome_obra = request.form["nome_obra"].strip()
+        valor_financiamento = parse_moeda(request.form.get("valor_financiamento"))
+        valor_entrada = parse_moeda(request.form.get("valor_entrada"))
+        valor_terreno = parse_moeda(request.form.get("valor_terreno"))
+        metro_quadrado = parse_moeda(request.form.get("metro_quadrado"))
+        valor_m2_usuario = parse_moeda(request.form.get("valor_m2_usuario"))
+
+        pdf_filename = obra["pdf_projeto"]
+        if "pdf_projeto" in request.files:
+            file = request.files["pdf_projeto"]
+            if file and file.filename and file.filename.lower().endswith(".pdf"):
+                pdf_filename = os.path.basename(file.filename)
+                file.save(os.path.join(app.config["UPLOAD_FOLDER"], pdf_filename))
+
+        conn.execute(
+            """
+            UPDATE obras
+            SET cliente_id = ?, nome_obra = ?, valor_financiamento = ?, valor_entrada = ?,
+                valor_terreno = ?, metro_quadrado = ?, valor_m2_usuario = ?, pdf_projeto = ?
+            WHERE id = ?
+        """,
+            (
+                cliente_id,
+                nome_obra,
+                valor_financiamento,
+                valor_entrada,
+                valor_terreno,
+                metro_quadrado,
+                valor_m2_usuario,
+                pdf_filename,
+                obra_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return redirect(url_for("detalhe_obra", obra_id=obra_id))
+
+    clientes = conn.execute("SELECT * FROM clientes ORDER BY nome").fetchall()
+    conn.close()
+
+    options = "".join(
+        [
+            f'<option value="{c["id"]}" {"selected" if c["id"] == obra["cliente_id"] else ""}>{c["nome"]}</option>'
+            for c in clientes
+        ]
+    )
+
+    body = f"""
+        <a href="/obra/{obra_id}" class="voltar">← Voltar para Resumo da Obra</a>
+        <div class="card" style="max-width: 650px;">
+            <h2>Editar Dados da Obra</h2>
             <form method="post" enctype="multipart/form-data" style="margin-top: 15px;">
-                <p>Cliente:<br>
-                <select name="cliente_id" required style="width: 100%;">
-                    <option value="">Selecione um cliente</option>
+                <label>Cliente:</label>
+                <select name="cliente_id">
+                    <option value="">Sem cliente</option>
                     {options}
-                </select></p>
-                <p>Nome da Obra:<br><input type="text" name="nome_obra" autocomplete="off" required style="width: 100%;"></p>
-                <p>Valor Financiamento (R$):<br><input type="number" step="0.01" name="valor_financiamento" autocomplete="off" style="width: 100%;"></p>
-                <p>Valor Entrada (R$):<br><input type="number" step="0.01" name="valor_entrada" autocomplete="off" style="width: 100%;"></p>
-                <p>Valor do Terreno (R$):<br><input type="number" step="0.01" name="valor_terreno" autocomplete="off" style="width: 100%;"></p>
-                <p>Área da Casa (m²):<br><input type="number" step="0.01" name="metro_quadrado" autocomplete="off" style="width: 100%;"></p>
-                <p>Projeto (PDF):<br><input type="file" name="pdf_projeto" accept=".pdf" style="width: 100%;"></p>
-                <button type="submit" class="btn" style="width: 100%; margin-top: 10px;">Salvar Obra</button>
+                </select>
+
+                <label>Nome da Obra:</label>
+                <input type="text" name="nome_obra" value="{obra["nome_obra"]}" required>
+
+                <label>Valor Financiamento (R$):</label>
+                <input type="text" name="valor_financiamento" value="{format_num_br(obra["valor_financiamento"], 2)}" required>
+
+                <label>Valor Entrada (R$):</label>
+                <input type="text" name="valor_entrada" value="{format_num_br(obra["valor_entrada"], 2)}" required>
+
+                <label>Valor do Terreno (R$):</label>
+                <input type="text" name="valor_terreno" value="{format_num_br(obra["valor_terreno"], 2)}" required>
+
+                <label>Área da Casa (m²):</label>
+                <input type="text" name="metro_quadrado" value="{format_num_br(obra["metro_quadrado"], 2)}" required>
+
+                <label>Valor por m² de Referência (R$/m²):</label>
+                <input type="text" name="valor_m2_usuario" value="{format_num_br(obra["valor_m2_usuario"], 2)}">
+
+                <label>Substituir Projeto (PDF) — Atual: {obra["pdf_projeto"] or "Nenhum"}:</label>
+                <input type="file" name="pdf_projeto" accept=".pdf">
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+                    <button type="submit" class="btn">Salvar Alterações</button>
+                    <a href="/obra/{obra_id}" class="btn btn-secundario">Cancelar</a>
+                </div>
             </form>
         </div>
-    '''
-    return render_layout(body, active_menu='obra')
+    """
+    return render_layout(body, active_menu="resumo")
 
-@app.route('/excluir_obra/<int:obra_id>')
+
+@app.route("/excluir_obra/<int:obra_id>")
+@login_required
 def excluir_obra(obra_id):
     conn = get_db_connection()
-    conn.execute('DELETE FROM materiais_obra WHERE obra_id = ?', (obra_id,))
-    conn.execute('DELETE FROM etapas_obra WHERE obra_id = ?', (obra_id,))
-    conn.execute('DELETE FROM obras WHERE id = ?', (obra_id,))
+    conn.execute("DELETE FROM materiais_obra WHERE obra_id = ?", (obra_id,))
+    conn.execute("DELETE FROM etapas_obra WHERE obra_id = ?", (obra_id,))
+    conn.execute("DELETE FROM obras WHERE id = ?", (obra_id,))
     conn.commit()
     conn.close()
-    return redirect(url_for('index'))
+    return redirect(url_for("index"))
 
-@app.route('/fornecedores', methods=('GET', 'POST'))
+
+@app.route("/fornecedores", methods=["GET", "POST"])
+@login_required
 def fornecedores():
     conn = get_db_connection()
-    if request.method == 'POST':
-        nome = request.form['nome']
-        telefone = request.form['telefone']
-        material_principal = request.form['material_principal']
-        
-        conn.execute('INSERT INTO fornecedores (nome, telefone, material_principal) VALUES (?, ?, ?)',
-                     (nome, telefone, material_principal))
+    if request.method == "POST":
+        nome = request.form["nome"].strip()
+        telefone = request.form["telefone"].strip()
+        material_principal = request.form["material_principal"].strip()
+        tipo_fornecedor = request.form.get("tipo_fornecedor") or "Material"
+        if tipo_fornecedor not in ("Material", "Mão de Obra"):
+            tipo_fornecedor = "Material"
+
+        conn.execute(
+            """
+            INSERT INTO fornecedores (nome, telefone, material_principal, tipo_fornecedor)
+            VALUES (?, ?, ?, ?)
+        """,
+            (nome, telefone, material_principal, tipo_fornecedor),
+        )
         conn.commit()
-        return redirect(url_for('fornecedores'))
-        
-    fornecedores_lista = conn.execute('SELECT * FROM fornecedores').fetchall()
+        conn.close()
+        return redirect(url_for("fornecedores"))
+
+    fornecedores_lista = conn.execute(
+        "SELECT * FROM fornecedores ORDER BY id DESC"
+    ).fetchall()
     conn.close()
-    
-    rows = ""
-    if fornecedores_lista:
-        for f in fornecedores_lista:
-            rows += f'''
+
+    mat_forn = [
+        f for f in fornecedores_lista if (f["tipo_fornecedor"] or "Material") == "Material"
+    ]
+    mo_forn = [f for f in fornecedores_lista if f["tipo_fornecedor"] == "Mão de Obra"]
+
+    def montar_linhas_forn(lista, vazio_msg):
+        if not lista:
+            return f'<tr><td colspan="4" style="text-align: center; color: #a0aec0;">{vazio_msg}</td></tr>'
+        html = ""
+        for f in lista:
+            html += f"""
                 <tr>
                     <td><strong style="color: #fff;">{f["nome"]}</strong></td>
-                    <td>{f["telefone"]}</td>
-                    <td>{f["material_principal"]}</td>
+                    <td>{f["telefone"] or "-"}</td>
+                    <td>{f["material_principal"] or "-"}</td>
                     <td><a href="/excluir_fornecedor/{f["id"]}" class="btn-excluir" onclick="return confirm('Excluir fornecedor?')">Excluir</a></td>
                 </tr>
-            '''
-    else:
-        rows = '<tr><td colspan="4" style="text-align: center; color: #a0aec0;">Nenhum fornecedor registado.</td></tr>'
+            """
+        return html
 
-    body = f'''
+    rows_mat = montar_linhas_forn(mat_forn, "Nenhum fornecedor de material registado.")
+    rows_mo = montar_linhas_forn(mo_forn, "Nenhum fornecedor de mão de obra registado.")
+
+    body = f"""
         <a href="/" class="voltar">← Voltar para o Início</a>
         <div class="card">
-            <h2>Gerir Fornecedores</h2>
-            <form method="post" style="margin-top: 15px; display: flex; gap: 10px; align-items: flex-end;">
-                <div>Nome:<br><input type="text" name="nome" autocomplete="off" required></div>
-                <div>Telefone:<br><input type="text" name="telefone" autocomplete="off"></div>
-                <div>Material Principal:<br><input type="text" name="material_principal" autocomplete="off"></div>
-                <button type="submit" class="btn">Registar</button>
-            </form>
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-form-forn')">
+                <h2 style="margin:0;">Gerir Fornecedores</h2>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-form-forn" class="collapsible-body">
+                <form method="post" style="margin-top: 15px; display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
+                    <div style="flex:1; min-width:180px;">
+                        <label>Tipo:</label>
+                        <select name="tipo_fornecedor" required>
+                            <option value="Material">Fornecedor de Materiais</option>
+                            <option value="Mão de Obra">Fornecedor de Mão de Obra</option>
+                        </select>
+                    </div>
+                    <div style="flex:1; min-width:180px;">
+                        <label>Nome:</label>
+                        <input type="text" name="nome" autocomplete="off" required>
+                    </div>
+                    <div style="flex:1; min-width:160px;">
+                        <label>Telefone:</label>
+                        <input type="text" name="telefone" autocomplete="off">
+                    </div>
+                    <div style="flex:1; min-width:180px;">
+                        <label>Especialidade / Material Principal:</label>
+                        <input type="text" name="material_principal" autocomplete="off">
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <button type="submit" class="btn">Registar</button>
+                    </div>
+                </form>
+            </div>
         </div>
-        <div class="card">
-            <h3>Lista de Fornecedores</h3>
-            <table>
-                <tr><th>Nome</th><th>Telefone</th><th>Material Principal</th><th>Ações</th></tr>
-                {rows}
-            </table>
-        </div>
-    '''
-    return render_layout(body, active_menu='fornecedores')
 
-@app.route('/excluir_fornecedor/<int:fornecedor_id>')
+        <div class="card">
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-forn-materiais')">
+                <h3 style="margin:0;">Fornecedores de Materiais</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-forn-materiais" class="collapsible-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Nome</th>
+                            <th>Telefone</th>
+                            <th>Material Principal</th>
+                            <th>Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows_mat}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-forn-mo')">
+                <h3 style="margin:0;">Fornecedores de Mão de Obra</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-forn-mo" class="collapsible-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Nome</th>
+                            <th>Telefone</th>
+                            <th>Serviço / Especialidade</th>
+                            <th>Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows_mo}</tbody>
+                </table>
+            </div>
+        </div>
+    """
+    return render_layout(body, active_menu="fornecedores")
+
+
+@app.route("/excluir_fornecedor/<int:fornecedor_id>")
+@login_required
 def excluir_fornecedor(fornecedor_id):
     conn = get_db_connection()
-    conn.execute('UPDATE materiais_obra SET fornecedor_id = NULL WHERE fornecedor_id = ?', (fornecedor_id,))
-    conn.execute('DELETE FROM fornecedores WHERE id = ?', (fornecedor_id,))
+    conn.execute(
+        "UPDATE materiais_obra SET fornecedor_id = NULL WHERE fornecedor_id = ?",
+        (fornecedor_id,),
+    )
+    conn.execute("DELETE FROM fornecedores WHERE id = ?", (fornecedor_id,))
     conn.commit()
     conn.close()
-    return redirect(url_for('fornecedores'))
+    return redirect(url_for("fornecedores"))
 
-@app.route('/estoque', methods=('GET', 'POST'))
+
+@app.route("/estoque", methods=["GET", "POST"])
+@login_required
 def estoque():
     conn = get_db_connection()
-    if request.method == 'POST':
-        descricao = request.form['descricao']
-        fornecedor_id = request.form['fornecedor_id'] or None
-        unidade = request.form['unidade'] or 'un'
-        qtd_comprada = float(request.form['qtd_comprada'] or 0)
-        valor_total_lote = float(request.form['valor_total_lote'] or 0)
-        
-        conn.execute('''
-            INSERT INTO estoque (descricao, fornecedor_id, unidade, qtd_comprada, valor_total_lote)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (descricao, fornecedor_id, unidade, qtd_comprada, valor_total_lote))
-        conn.commit()
-        return redirect(url_for('estoque'))
-        
-    itens_estoque_cursor = conn.execute('''
-        SELECT estoque.*, fornecedores.nome as fornecedor_nome 
-        FROM estoque 
+    if request.method == "POST":
+        descricao = request.form["descricao"].strip()
+        fornecedor_id = request.form.get("fornecedor_id") or None
+        unidade = request.form.get("unidade") or "un"
+        qtd_comprada = parse_moeda(request.form.get("qtd_comprada"))
+        valor_total_lote = parse_moeda(request.form.get("valor_total_lote"))
+
+        if qtd_comprada > 0:
+            conn.execute(
+                """
+                INSERT INTO estoque (descricao, fornecedor_id, unidade, qtd_comprada, valor_total_lote)
+                VALUES (?, ?, ?, ?, ?)
+            """,
+                (descricao, fornecedor_id, unidade, qtd_comprada, valor_total_lote),
+            )
+            conn.commit()
+        conn.close()
+        return redirect(url_for("estoque"))
+
+    itens_estoque_cursor = conn.execute(
+        """
+        SELECT estoque.*, fornecedores.nome as fornecedor_nome
+        FROM estoque
         LEFT JOIN fornecedores ON estoque.fornecedor_id = fornecedores.id
-    ''').fetchall()
-    
+        ORDER BY estoque.id DESC
+    """
+    ).fetchall()
+
     itens_estoque = []
     for item in itens_estoque_cursor:
         item_dict = dict(item)
-        usado = conn.execute('SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ?', (item['id'],)).fetchone()['total'] or 0
-        saldo_atual = item['qtd_comprada'] - usado
-        
+        usado_row = conn.execute(
+            "SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ?",
+            (item["id"],),
+        ).fetchone()
+        usado = float(usado_row["total"] or 0.0)
+        saldo_atual = float(item["qtd_comprada"] or 0.0) - usado
+
         if saldo_atual <= 0:
-            conn.execute('DELETE FROM estoque WHERE id = ?', (item['id'],))
+            conn.execute("DELETE FROM estoque WHERE id = ?", (item["id"],))
             conn.commit()
         else:
-            item_dict['saldo_atual'] = saldo_atual
+            item_dict["saldo_atual"] = saldo_atual
             itens_estoque.append(item_dict)
 
-    fornecedores = conn.execute('SELECT * FROM fornecedores').fetchall()
+    fornecedores = conn.execute(
+        "SELECT * FROM fornecedores WHERE tipo_fornecedor = 'Material' OR tipo_fornecedor IS NULL ORDER BY nome"
+    ).fetchall()
     conn.close()
-    
-    fornecedor_options = "".join([f'<option value="{f["id"]}">{f["nome"]}</option>' for f in fornecedores])
-    
+
+    fornecedor_options = "".join(
+        [f'<option value="{f["id"]}">{f["nome"]}</option>' for f in fornecedores]
+    )
+
     rows = ""
     if itens_estoque:
         for item in itens_estoque:
-            rows += f'''
+            rows += f"""
                 <tr>
                     <td><strong style="color: #fff;">{item["descricao"]}</strong></td>
                     <td>{item["fornecedor_nome"] or "Não informado"}</td>
                     <td>{item["unidade"]}</td>
-                    <td style="color: #63b3ed; font-weight: bold;">{item["saldo_atual"]} / {item["qtd_comprada"]}</td>
-                    <td>R$ {item["valor_total_lote"]:,.2f}</td>
-                    <td style="color: #48bb78; font-weight: bold;">R$ {item["valor_unitario"]:,.2f} / {item["unidade"]}</td>
+                    <td style="color: #63b3ed; font-weight: bold;">{format_num_br(item["saldo_atual"], 2)} / {format_num_br(item["qtd_comprada"], 2)}</td>
+                    <td>{format_brl(item["valor_total_lote"])}</td>
+                    <td style="color: #48bb78; font-weight: bold;">{format_brl(item["valor_unitario"])} / {item["unidade"]}</td>
                     <td><a href="/excluir_estoque/{item["id"]}" class="btn-excluir" onclick="return confirm('Excluir lote?')">Excluir</a></td>
                 </tr>
-            '''
+            """
     else:
         rows = '<tr><td colspan="7" style="text-align: center; color: #a0aec0;">Nenhum lote disponível em estoque.</td></tr>'
 
-    body = f'''
+    body = f"""
         <a href="/" class="voltar">← Voltar para o Início</a>
         <div class="card">
-            <h2>📦 Compras em Lote / Estoque Geral</h2>
-            <form method="post" style="margin-top: 15px; display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap;">
-                <div>Material:<br><input type="text" name="descricao" placeholder="Ex: Coluna" autocomplete="off" required></div>
-                <div>Fornecedor:<br>
-                    <select name="fornecedor_id">
-                        <option value="">Nenhum/Outro</option>
-                        {fornecedor_options}
-                    </select>
-                </div>
-                <div>Unidade:<br>
-                    <select name="unidade" required>
-                        <option value="m">m</option><option value="m²">m²</option><option value="m³">m³</option>
-                        <option value="un">un</option><option value="sc">sc</option><option value="kg">kg</option>
-                    </select>
-                </div>
-                <div>Qtd:<br><input type="number" step="0.01" name="qtd_comprada" required style="width: 80px;"></div>
-                <div>Total (R$):<br><input type="number" step="0.01" name="valor_total_lote" required style="width: 100px;"></div>
-                <button type="submit" class="btn">Cadastrar Lote</button>
-            </form>
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-form-estoque')">
+                <h2 style="margin:0;">📦 Compras em Lote / Estoque Geral</h2>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-form-estoque" class="collapsible-body">
+                <form method="post" style="margin-top: 15px; display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
+                    <div style="flex:1; min-width:180px;">
+                        <label>Material:</label>
+                        <input type="text" name="descricao" placeholder="Ex: Coluna" autocomplete="off" required>
+                    </div>
+                    <div style="flex:1; min-width:170px;">
+                        <label>Fornecedor:</label>
+                        <select name="fornecedor_id">
+                            <option value="">Nenhum/Outro</option>
+                            {fornecedor_options}
+                        </select>
+                    </div>
+                    <div style="width:110px;">
+                        <label>Unidade:</label>
+                        <select name="unidade" required>
+                            <option value="m">m</option>
+                            <option value="m²">m²</option>
+                            <option value="m³">m³</option>
+                            <option value="un">un</option>
+                            <option value="sc">sc</option>
+                            <option value="kg">kg</option>
+                        </select>
+                    </div>
+                    <div style="width:130px;">
+                        <label>Qtd:</label>
+                        <input type="text" name="qtd_comprada" placeholder="Ex: 50" required>
+                    </div>
+                    <div style="width:150px;">
+                        <label>Total (R$):</label>
+                        <input type="text" name="valor_total_lote" placeholder="Ex: 1500,00" required>
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <button type="submit" class="btn">Cadastrar Lote</button>
+                    </div>
+                </form>
+            </div>
         </div>
-        <div class="card">
-            <h3>Lotes em estoque (Saldo Disponível)</h3>
-            <table>
-                <tr><th>Material</th><th>Fornecedor</th><th>Unidade</th><th>Saldo / Comprado</th><th>Valor Total</th><th>Custo Unitário</th><th>Ações</th></tr>
-                {rows}
-            </table>
-        </div>
-    '''
-    return render_layout(body, active_menu='estoque')
 
-@app.route('/excluir_estoque/<int:estoque_id>')
+        <div class="card">
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-lotes-estoque')">
+                <h3 style="margin:0;">Lotes em estoque (Saldo Disponível)</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-lotes-estoque" class="collapsible-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Material</th>
+                            <th>Fornecedor</th>
+                            <th>Unidade</th>
+                            <th>Saldo / Comprado</th>
+                            <th>Valor Total</th>
+                            <th>Custo Unitário</th>
+                            <th>Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+    """
+    return render_layout(body, active_menu="estoque")
+
+
+@app.route("/excluir_estoque/<int:estoque_id>")
+@login_required
 def excluir_estoque(estoque_id):
     conn = get_db_connection()
-    conn.execute('DELETE FROM estoque WHERE id = ?', (estoque_id,))
+    conn.execute("DELETE FROM estoque WHERE id = ?", (estoque_id,))
     conn.commit()
     conn.close()
-    return redirect(url_for('estoque'))
+    return redirect(url_for("estoque"))
 
-@app.route('/uploads/<filename>')
+
+@app.route("/uploads/<filename>")
+@login_required
 def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
-@app.route('/obra/<int:obra_id>', methods=('GET', 'POST'))
+
+@app.route("/editar_material/<int:material_id>", methods=["GET", "POST"])
+@login_required
+def editar_material(material_id):
+    conn = get_db_connection()
+    item = conn.execute(
+        "SELECT * FROM materiais_obra WHERE id = ?", (material_id,)
+    ).fetchone()
+    if not item:
+        conn.close()
+        return redirect(url_for("index"))
+
+    obra_id = item["obra_id"]
+
+    if request.method == "POST":
+        descricao = request.form["descricao"].strip()
+        categoria = request.form.get("categoria") or "Alvenaria"
+        if categoria not in CATEGORIAS_OBRA:
+            categoria = "Alvenaria"
+        tipo_item = request.form.get("tipo_item") or "Material"
+        if tipo_item not in ("Material", "Mão de Obra"):
+            tipo_item = "Material"
+        fornecedor_id = request.form.get("fornecedor_id") or None
+        unidade = request.form.get("unidade") or "un"
+        quantidade = parse_moeda(request.form.get("quantidade"))
+        valor_unitario = parse_moeda(request.form.get("valor_unitario"))
+
+        if item["estoque_id"]:
+            est = conn.execute(
+                "SELECT qtd_comprada FROM estoque WHERE id = ?", (item["estoque_id"],)
+            ).fetchone()
+            if est:
+                usado_outros_row = conn.execute(
+                    "SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ? AND id != ?",
+                    (item["estoque_id"], material_id),
+                ).fetchone()
+                usado_outros = float(usado_outros_row["total"] or 0.0)
+                max_permitido = float(est["qtd_comprada"] or 0.0) - usado_outros
+                if quantidade > max_permitido:
+                    conn.close()
+                    return f"<script>alert('Erro: Quantidade maior que o saldo disponível no lote ({format_num_br(max_permitido, 2)}).'); window.history.back();</script>"
+
+        conn.execute(
+            """
+            UPDATE materiais_obra
+            SET descricao = ?, categoria = ?, tipo_item = ?, fornecedor_id = ?,
+                unidade = ?, quantidade = ?, valor_unitario = ?
+            WHERE id = ?
+        """,
+            (
+                descricao,
+                categoria,
+                tipo_item,
+                fornecedor_id,
+                unidade,
+                quantidade,
+                valor_unitario,
+                material_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return redirect(url_for("detalhe_obra", obra_id=obra_id))
+
+    fornecedores = conn.execute("SELECT * FROM fornecedores ORDER BY nome").fetchall()
+    conn.close()
+
+    cat_opts = "".join(
+        [
+            f'<option value="{c}" {"selected" if c == (item["categoria"] or "Alvenaria") else ""}>{c}</option>'
+            for c in CATEGORIAS_OBRA
+        ]
+    )
+    tipo_atual = item["tipo_item"] or "Material"
+    tipo_opts = f"""
+        <option value="Material" {"selected" if tipo_atual == "Material" else ""}>Material</option>
+        <option value="Mão de Obra" {"selected" if tipo_atual == "Mão de Obra" else ""}>Mão de Obra</option>
+    """
+    forn_opts = '<option value="">Nenhum</option>' + "".join(
+        [
+            f'<option value="{f["id"]}" {"selected" if f["id"] == item["fornecedor_id"] else ""}>{f["nome"]}</option>'
+            for f in fornecedores
+        ]
+    )
+
+    body = f"""
+        <a href="/obra/{obra_id}" class="voltar">← Voltar para a Obra</a>
+        <div class="card" style="max-width: 600px;">
+            <h2>Editar Material / Mão de Obra</h2>
+            <form method="post" style="margin-top: 15px;">
+                <label>Descrição:</label>
+                <input type="text" name="descricao" value="{item["descricao"]}" required>
+
+                <label>Tipo:</label>
+                <select name="tipo_item">{tipo_opts}</select>
+
+                <label>Categoria (Etapa):</label>
+                <select name="categoria">{cat_opts}</select>
+
+                <label>Fornecedor:</label>
+                <select name="fornecedor_id">{forn_opts}</select>
+
+                <label>Unidade:</label>
+                <input type="text" name="unidade" value="{item["unidade"]}" required>
+
+                <label>Quantidade:</label>
+                <input type="text" name="quantidade" value="{format_num_br(item["quantidade"], 2)}" required>
+
+                <label>Valor Unitário (R$):</label>
+                <input type="text" name="valor_unitario" value="{format_num_br(item["valor_unitario"], 2)}" required>
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+                    <button type="submit" class="btn">Salvar Alterações</button>
+                    <a href="/obra/{obra_id}" class="btn btn-secundario">Cancelar</a>
+                </div>
+            </form>
+        </div>
+    """
+    return render_layout(body, active_menu="resumo")
+
+
+@app.route("/obra/<int:obra_id>", methods=["GET", "POST"])
+@login_required
 def detalhe_obra(obra_id):
     conn = get_db_connection()
-    
-    if request.method == 'POST':
-        if 'atualizar_etapa' in request.form:
-            etapa_id = request.form['etapa_id']
-            novo_perc = float(request.form['percentual'] or 0)
-            conn.execute('UPDATE etapas_obra SET percentual = ? WHERE id = ?', (novo_perc, etapa_id))
+
+    if request.method == "POST":
+        if "atualizar_etapa" in request.form:
+            etapa_id = request.form["etapa_id"]
+            novo_perc = parse_moeda(request.form.get("percentual"))
+            conn.execute(
+                "UPDATE etapas_obra SET percentual = ? WHERE id = ?",
+                (novo_perc, etapa_id),
+            )
             conn.commit()
             conn.close()
-            return redirect(url_for('detalhe_obra', obra_id=obra_id))
+            return redirect(url_for("detalhe_obra", obra_id=obra_id))
 
-        estoque_id = request.form.get('estoque_id')
+        if "salvar_valor_m2" in request.form:
+            novo_valor_m2 = parse_moeda(request.form.get("valor_m2_usuario"))
+            conn.execute(
+                "UPDATE obras SET valor_m2_usuario = ? WHERE id = ?",
+                (novo_valor_m2, obra_id),
+            )
+            conn.commit()
+            conn.close()
+            return redirect(url_for("detalhe_obra", obra_id=obra_id))
+
+        estoque_id = request.form.get("estoque_id")
         if estoque_id:
-            item_est = conn.execute('SELECT * FROM estoque WHERE id = ?', (estoque_id,)).fetchone()
+            item_est = conn.execute(
+                "SELECT * FROM estoque WHERE id = ?", (estoque_id,)
+            ).fetchone()
             if item_est:
-                usado = conn.execute('SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ?', (item['id'],)).fetchone()['total'] or 0 if 'item' in locals() else 0
-                # recalculando saldo correto
-                usado_real = conn.execute('SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ?', (estoque_id,)).fetchone()['total'] or 0
-                saldo_disponivel = item_est['qtd_comprada'] - usado_real
-                quantidade_desejada = float(request.form['quantidade_lote'] or 0)
-                
+                usado_row = conn.execute(
+                    "SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ?",
+                    (estoque_id,),
+                ).fetchone()
+                usado_real = float(usado_row["total"] or 0.0)
+                saldo_disponivel = float(item_est["qtd_comprada"] or 0.0) - usado_real
+                quantidade_desejada = parse_moeda(request.form.get("quantidade_lote"))
+                categoria_lote = request.form.get("categoria_lote") or "Alvenaria"
+                if categoria_lote not in CATEGORIAS_OBRA:
+                    categoria_lote = "Alvenaria"
+
                 if quantidade_desejada > saldo_disponivel:
                     conn.close()
-                    return f"<script>alert('Erro: Quantidade solicitada maior que o saldo disponível em estoque ({saldo_disponivel} {item_est.unidade})!'); window.history.back();</script>"
-                
-                conn.execute('''
-                    INSERT INTO materiais_obra (obra_id, fornecedor_id, estoque_id, descricao, unidade, quantidade, valor_unitario)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (obra_id, item_est['fornecedor_id'], estoque_id, item_est['descricao'], item_est['unidade'], quantidade_desejada, item_est['valor_unitario']))
-                conn.commit()
+                    return f"<script>alert('Erro: Quantidade solicitada maior que o saldo disponível em estoque ({format_num_br(saldo_disponivel, 2)} {item_est['unidade']})'); window.history.back();</script>"
+
+                if quantidade_desejada > 0:
+                    conn.execute(
+                        """
+                        INSERT INTO materiais_obra (
+                            obra_id, fornecedor_id, estoque_id, categoria, tipo_item,
+                            descricao, unidade, quantidade, valor_unitario
+                        )
+                        VALUES (?, ?, ?, ?, 'Material', ?, ?, ?, ?)
+                    """,
+                        (
+                            obra_id,
+                            item_est["fornecedor_id"],
+                            estoque_id,
+                            categoria_lote,
+                            item_est["descricao"],
+                            item_est["unidade"],
+                            quantidade_desejada,
+                            item_est["valor_unitario"],
+                        ),
+                    )
+                    conn.commit()
         else:
-            descricao = request.form['descricao']
-            unidade = request.form['unidade'] or 'un'
-            quantidade = float(request.form['quantidade'] or 0)
-            valor_unitario = float(request.form['valor_unitario'] or 0)
-            fornecedor_id = request.form['fornecedor_id'] or None
-            
-            if quantidade > 0:
-                conn.execute('''
-                    INSERT INTO materiais_obra (obra_id, fornecedor_id, descricao, unidade, quantidade, valor_unitario)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (obra_id, fornecedor_id, descricao, unidade, quantidade, valor_unitario))
+            descricao = (request.form.get("descricao") or "").strip()
+            categoria = request.form.get("categoria") or "Alvenaria"
+            if categoria not in CATEGORIAS_OBRA:
+                categoria = "Alvenaria"
+            tipo_item = request.form.get("tipo_item") or "Material"
+            if tipo_item not in ("Material", "Mão de Obra"):
+                tipo_item = "Material"
+            unidade = request.form.get("unidade") or "un"
+            quantidade = parse_moeda(request.form.get("quantidade"))
+            valor_unitario = parse_moeda(request.form.get("valor_unitario"))
+            fornecedor_id = request.form.get("fornecedor_id") or None
+
+            if descricao and quantidade > 0:
+                conn.execute(
+                    """
+                    INSERT INTO materiais_obra (
+                        obra_id, fornecedor_id, estoque_id, categoria, tipo_item,
+                        descricao, unidade, quantidade, valor_unitario
+                    )
+                    VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        obra_id,
+                        fornecedor_id,
+                        categoria,
+                        tipo_item,
+                        descricao,
+                        unidade,
+                        quantidade,
+                        valor_unitario,
+                    ),
+                )
                 conn.commit()
-                
+
         conn.close()
-        return redirect(url_for('detalhe_obra', obra_id=obra_id))
-        
-    obra = conn.execute('''
-        SELECT obras.*, clientes.nome as cliente_nome, clientes.telefone as cliente_tel 
-        FROM obras 
-        LEFT JOIN clientes ON obras.cliente_id = clientes.id 
+        return redirect(url_for("detalhe_obra", obra_id=obra_id))
+
+    obra = conn.execute(
+        """
+        SELECT obras.*, clientes.nome as cliente_nome, clientes.telefone as cliente_tel
+        FROM obras
+        LEFT JOIN clientes ON obras.cliente_id = clientes.id
         WHERE obras.id = ?
-    ''', (obra_id,)).fetchone()
-    
-    materiais = conn.execute('''
-        SELECT materiais_obra.*, fornecedores.nome as fornecedor_nome 
-        FROM materiais_obra 
-        LEFT JOIN fornecedores ON materiais_obra.fornecedor_id = fornecedores.id 
+    """,
+        (obra_id,),
+    ).fetchone()
+
+    if not obra:
+        conn.close()
+        return redirect(url_for("index"))
+
+    materiais = conn.execute(
+        """
+        SELECT materiais_obra.*, fornecedores.nome as fornecedor_nome
+        FROM materiais_obra
+        LEFT JOIN fornecedores ON materiais_obra.fornecedor_id = fornecedores.id
         WHERE materiais_obra.obra_id = ?
-    ''', (obra_id,)).fetchall()
-    
-    etapas = conn.execute('SELECT * FROM etapas_obra WHERE obra_id = ?', (obra_id,)).fetchall()
-    fornecedores = conn.execute('SELECT * FROM fornecedores').fetchall()
-    
-    itens_estoque_cursor = conn.execute('SELECT * FROM estoque').fetchall()
+        ORDER BY materiais_obra.id DESC
+    """,
+        (obra_id,),
+    ).fetchall()
+
+    etapas = conn.execute(
+        "SELECT * FROM etapas_obra WHERE obra_id = ? ORDER BY id ASC", (obra_id,)
+    ).fetchall()
+    fornecedores = conn.execute("SELECT * FROM fornecedores ORDER BY nome").fetchall()
+
+    itens_estoque_cursor = conn.execute("SELECT * FROM estoque").fetchall()
     itens_estoque = []
     for item in itens_estoque_cursor:
-        usado = conn.execute('SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ?', (item['id'],)).fetchone()['total'] or 0
-        saldo = item['qtd_comprada'] - usado
+        usado_row = conn.execute(
+            "SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ?",
+            (item["id"],),
+        ).fetchone()
+        usado = float(usado_row["total"] or 0.0)
+        saldo = float(item["qtd_comprada"] or 0.0) - usado
         if saldo > 0:
             item_dict = dict(item)
-            item_dict['saldo'] = saldo
+            item_dict["saldo"] = saldo
             itens_estoque.append(item_dict)
-    
-    progresso_medio = (sum(e['percentual'] for e in etapas) / len(etapas)) if etapas else 0.0
-    custo_materiais = sum(m['valor_total'] for m in materiais if m['valor_total'] is not None)
-    custo_total_obra = custo_materiais + (obra['valor_terreno'] or 0.0)
-    receita_total = (obra['valor_financiamento'] or 0.0) + (obra['valor_entrada'] or 0.0)
-    lucro_estimado = receita_total - custo_total_obra
-    custo_por_m2 = (custo_total_obra / obra['metro_quadrado']) if (obra['metro_quadrado'] or 0) > 0 else 0.0
-    
+
     conn.close()
-    
+
+    progresso_medio = (
+        sum(float(e["percentual"] or 0.0) for e in etapas) / len(etapas)
+        if etapas
+        else 0.0
+    )
+    custo_materiais = sum(
+        float(m["valor_total"] or 0.0) for m in materiais if m["valor_total"] is not None
+    )
+    custo_total_obra = custo_materiais + float(obra["valor_terreno"] or 0.0)
+    receita_total = float(obra["valor_financiamento"] or 0.0) + float(
+        obra["valor_entrada"] or 0.0
+    )
+    lucro_estimado = receita_total - custo_total_obra
+    area_m2 = float(obra["metro_quadrado"] or 0.0)
+    custo_por_m2 = (custo_total_obra / area_m2) if area_m2 > 0 else 0.0
+    valor_m2_usuario = float(obra["valor_m2_usuario"] or 0.0)
+    valor_total_m2_usuario = valor_m2_usuario * area_m2
+
     etapas_rows = ""
     for etapa in etapas:
-        status_color = "#48bb78" if etapa['percentual'] == 100 else ("#ed8936" if etapa['percentual'] > 0 else "#a0aec0")
-        status_text = "Concluído" if etapa['percentual'] == 100 else ("Em Andamento" if etapa['percentual'] > 0 else "Não Iniciado")
-        etapas_rows += f'''
+        perc = float(etapa["percentual"] or 0.0)
+        status_color = (
+            "#48bb78" if perc >= 100 else ("#ed8936" if perc > 0 else "#a0aec0")
+        )
+        status_text = (
+            "Concluído" if perc >= 100 else ("Em Andamento" if perc > 0 else "Não Iniciado")
+        )
+        etapas_rows += f"""
             <tr>
                 <td>{etapa["nome_etapa"]}</td>
                 <td>
-                    <form method="post" style="display:inline;">
+                    <form method="post" style="display:flex; align-items:center; gap:6px; margin:0;">
                         <input type="hidden" name="atualizar_etapa" value="1">
                         <input type="hidden" name="etapa_id" value="{etapa["id"]}">
-                        <input type="number" step="0.1" min="0" max="100" name="percentual" value="{etapa["percentual"]}" style="width: 70px;"> %
-                        <button type="submit" class="btn" style="padding: 4px 8px; font-size: 11px;">Atualizar</button>
+                        <input type="text" name="percentual" value="{format_num_br(perc, 1)}" style="width:75px; margin:0; padding:6px;"> %
+                        <button type="submit" class="btn" style="padding:6px 10px; font-size:12px;">Atualizar</button>
                     </form>
                 </td>
                 <td><strong style="color: {status_color};">{status_text}</strong></td>
             </tr>
-        '''
+        """
 
-    materiais_rows = ""
-    if materiais:
-        for m in materiais:
-            materiais_rows += f'''
-                <tr>
-                    <td><strong style="color: #fff;">{m["descricao"]}</strong></td>
-                    <td>{m["fornecedor_nome"] or "Não informado"}</td>
-                    <td>{m["unidade"]}</td>
-                    <td>{m["quantidade"]}</td>
-                    <td>R$ {m["valor_unitario"]:,.2f}</td>
-                    <td>R$ {m["valor_total"]:,.2f}</td>
-                    <td><a href="/excluir_material/{m["id"]}" class="btn-excluir" onclick="return confirm('Excluir item?')">Excluir</a></td>
-                </tr>
-            '''
+    # Tabelas organizadas por categoria (Alvenaria, Hidráulica, Elétrica, Pintura)
+    blocos_categorias_html = ""
+    for idx_cat, cat_nome in enumerate(CATEGORIAS_OBRA):
+        itens_cat = [
+            m for m in materiais if (m["categoria"] or "Alvenaria") == cat_nome
+        ]
+        subtotal_cat = sum(float(m["valor_total"] or 0.0) for m in itens_cat)
+        if itens_cat:
+            rows_cat = ""
+            for m in itens_cat:
+                tipo_badge = (
+                    '<span class="badge-tipo badge-mo">Mão de Obra</span>'
+                    if m["tipo_item"] == "Mão de Obra"
+                    else '<span class="badge-tipo badge-mat">Material</span>'
+                )
+                rows_cat += f"""
+                    <tr>
+                        <td><strong style="color: #fff;">{m["descricao"]}</strong></td>
+                        <td>{tipo_badge}</td>
+                        <td>{m["fornecedor_nome"] or "Não informado"}</td>
+                        <td>{m["unidade"]}</td>
+                        <td>{format_num_br(m["quantidade"], 2)}</td>
+                        <td>{format_brl(m["valor_unitario"])}</td>
+                        <td style="font-weight:bold; color:#fff;">{format_brl(m["valor_total"])}</td>
+                        <td>
+                            <a href="/editar_material/{m["id"]}" class="btn-detalhe" style="color:#d4af37;">Editar</a>
+                            <a href="/excluir_material/{m["id"]}" class="btn-excluir" onclick="return confirm('Excluir item?')">Excluir</a>
+                        </td>
+                    </tr>
+                """
+        else:
+            rows_cat = f'<tr><td colspan="8" style="text-align: center; color: #a0aec0;">Nenhum lançamento em {cat_nome}.</td></tr>'
+
+        sec_id = f"sec-cat-{idx_cat}"
+        blocos_categorias_html += f"""
+            <div class="card">
+                <div class="card-header-toggle" onclick="toggleSection(this, '{sec_id}')">
+                    <h3 style="margin:0;">{cat_nome} <span style="color:#d4af37; font-size:14px;">— Subtotal: {format_brl(subtotal_cat)}</span></h3>
+                    <span class="toggle-arrow">▾ Fechar</span>
+                </div>
+                <div id="{sec_id}" class="collapsible-body">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Descrição</th>
+                                <th>Tipo</th>
+                                <th>Fornecedor</th>
+                                <th>Unidade</th>
+                                <th>Quantidade</th>
+                                <th>Valor Unitário</th>
+                                <th>Valor Total</th>
+                                <th>Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody>{rows_cat}</tbody>
+                    </table>
+                </div>
+            </div>
+        """
+
+    estoque_options = "".join(
+        [
+            f'<option value="{i["id"]}">{i["descricao"]} (Disp: {format_num_br(i["saldo"], 2)} {i["unidade"]} | {format_brl(i["valor_unitario"])})</option>'
+            for i in itens_estoque
+        ]
+    )
+    forn_options = "".join(
+        [
+            f'<option value="{f["id"]}">{f["nome"]} ({f["tipo_fornecedor"] or "Material"})</option>'
+            for f in fornecedores
+        ]
+    )
+    cat_select_options = "".join(
+        [f'<option value="{c}">{c}</option>' for c in CATEGORIAS_OBRA]
+    )
+
+    if obra["pdf_projeto"]:
+        pdf_proj = f'<a href="/uploads/{obra["pdf_projeto"]}" target="_blank" style="color: #d4af37; font-weight: bold;">Abrir PDF</a>'
     else:
-        materiais_rows = '<tr><td colspan="7" style="text-align: center; color: #a0aec0;">Nenhum material registado.</td></tr>'
+        pdf_proj = "Nenhum PDF"
 
-    estoque_options = "".join([f'<option value="{i["id"]}">{i["descricao"]} (Disp: {i["saldo"]} {i["unidade"]} | R$ {i["valor_unitario"]:,.2f})</option>' for i in itens_estoque])
-    forn_options = "".join([f'<option value="{f["id"]}">{f["nome"]}</option>' for f in fornecedores])
-    pdf_proj = f'<a href="/uploads/{obra["pdf_projeto"]}" target="_blank" style="color: #d4af37; font-weight: bold;">Abrir PDF</a>' if obra['pdf_projeto'] else 'Nenhum PDF'
+    lucro_cor = "#48bb78" if lucro_estimado >= 0 else "#fc8181"
 
-    body = f'''
+    body = f"""
         <a href="/" class="voltar">← Voltar para o Início</a>
-        <h1>Obra: {obra["nome_obra"]}</h1>
-        
-        <div class="card">
-            <h3>Resumo Financeiro e Métricas</h3>
-            <p><strong>Cliente:</strong> {obra["cliente_nome"]} (Tel: {obra["cliente_tel"]})</p>
-            <p><strong>Financiamento:</strong> R$ {obra["valor_financiamento"]:,.2f} | <strong>Entrada:</strong> R$ {obra["valor_entrada"]:,.2f}</p>
-            <p><strong>Terreno:</strong> R$ {obra["valor_terreno"]:,.2f} | <strong>Área:</strong> {obra["metro_quadrado"]} m²</p>
-            <p><strong>Progresso Médio:</strong> <span style="color: #63b3ed; font-weight: bold;">{progresso_medio:.1f}%</span></p>
-            <hr>
-            <p><strong>Total Materiais:</strong> R$ {custo_materiais:,.2f} | <strong>Custo Total:</strong> R$ {custo_total_obra:,.2f}</p>
-            <p><strong>Custo por m²:</strong> R$ {custo_por_m2:,.2f} / m²</p>
-            <p><strong>Lucro Estimado:</strong> <span style="color: {"#48bb78" if lucro_estimado >= 0 else "#fc8181"}; font-weight: bold;">R$ {lucro_estimado:,.2f}</span></p>
-            <p><strong>Projeto PDF:</strong> {pdf_proj}</p>
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:20px;">
+            <h1 style="margin:0;">Obra: {obra["nome_obra"]}</h1>
+            <a href="/editar_obra/{obra["id"]}" class="btn btn-secundario">✏️ Editar Dados da Obra</a>
         </div>
 
         <div class="card">
-            <h3>Cronograma e Medição (Caixa Econômica Federal)</h3>
-            <table>
-                <tr><th>Etapa da Obra</th><th>% Executado</th><th>Status</th></tr>
-                {etapas_rows}
-            </table>
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-resumo-obra')">
+                <h3 style="margin:0;">Resumo Financeiro e Métricas</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-resumo-obra" class="collapsible-body" style="margin-top:15px;">
+                <p><strong>Cliente:</strong> {obra["cliente_nome"] or "-"} (Tel: {obra["cliente_tel"] or "-"})</p>
+                <p><strong>Financiamento:</strong> {format_brl(obra["valor_financiamento"])} | <strong>Entrada:</strong> {format_brl(obra["valor_entrada"])}</p>
+                <p><strong>Terreno:</strong> {format_brl(obra["valor_terreno"])} | <strong>Área:</strong> {format_num_br(area_m2, 2)} m²</p>
+                <p><strong>Progresso Médio:</strong> <span style="color: #63b3ed; font-weight: bold;">{format_num_br(progresso_medio, 1)}%</span></p>
+                <hr>
+                <p><strong>Total Materiais / M.O.:</strong> {format_brl(custo_materiais)} | <strong>Custo Total:</strong> {format_brl(custo_total_obra)}</p>
+                <p><strong>Custo por m²:</strong> {format_brl(custo_por_m2)} / m²</p>
+                <p><strong>Lucro Estimado:</strong> <span style="color: {lucro_cor}; font-weight: bold;">{format_brl(lucro_estimado)}</span></p>
+                <p><strong>Projeto PDF:</strong> {pdf_proj}</p>
+
+                <hr>
+                <form method="post" style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-top:10px;">
+                    <input type="hidden" name="salvar_valor_m2" value="1">
+                    <div style="min-width:220px;">
+                        <label><strong>Seu Valor por m² (R$/m²):</strong></label>
+                        <input type="text" name="valor_m2_usuario" value="{format_num_br(valor_m2_usuario, 2)}" placeholder="Ex: 2800,00" style="margin-bottom:0;">
+                    </div>
+                    <button type="submit" class="btn">Salvar Valor m²</button>
+                </form>
+                <p style="margin-top:10px; color:#d4af37; font-size:13px;">
+                    <strong>Valor Estimado pela Área ({format_num_br(area_m2, 2)} m² × {format_brl(valor_m2_usuario)}):</strong> {format_brl(valor_total_m2_usuario)}
+                </p>
+            </div>
         </div>
 
         <div class="card" style="border-left: 5px solid #d4af37;">
-            <h3>📦 Puxar do Estoque / Lote Comprado</h3>
-            <form method="post" style="margin-top: 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                <select name="estoque_id" required style="width: 300px;">
-                    <option value="">Selecione um lote...</option>
-                    {estoque_options}
-                </select>
-                Qtd: <input type="number" step="0.01" name="quantidade_lote" required style="width: 80px;">
-                <button type="submit" class="btn">Alocar na Obra</button>
-            </form>
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-puxar-estoque')">
+                <h3 style="margin:0;">📦 Puxar do Estoque / Lote Comprado</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-puxar-estoque" class="collapsible-body">
+                <form method="post" style="margin-top: 15px; display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
+                    <div style="flex:1; min-width:220px;">
+                        <label>Lote:</label>
+                        <select name="estoque_id" required>
+                            <option value="">Selecione um lote...</option>
+                            {estoque_options}
+                        </select>
+                    </div>
+                    <div style="width:170px;">
+                        <label>Categoria:</label>
+                        <select name="categoria_lote">{cat_select_options}</select>
+                    </div>
+                    <div style="width:120px;">
+                        <label>Qtd:</label>
+                        <input type="text" name="quantidade_lote" placeholder="Ex: 10" required>
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <button type="submit" class="btn">Alocar na Obra</button>
+                    </div>
+                </form>
+            </div>
         </div>
 
         <div class="card">
-            <h3>🛒 Registar Compra Avulsa / Direta</h3>
-            <form method="post" style="margin-top: 10px; display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap;">
-                <div>Descrição:<br><input type="text" name="descricao" required></div>
-                <div>Fornecedor:<br><select name="fornecedor_id"><option value="">Nenhum</option>{forn_options}</select></div>
-                <div>Unidade:<br><select name="unidade"><option value="un">un</option><option value="m">m</option><option value="m²">m²</option><option value="m³">m³</option><option value="sc">sc</option><option value="kg">kg</option></select></div>
-                <div>Qtd:<br><input type="number" step="0.01" name="quantidade" required style="width: 70px;"></div>
-                <div>Unitário (R$):<br><input type="number" step="0.01" name="valor_unitario" required style="width: 90px;"></div>
-                <button type="submit" class="btn">Adicionar</button>
-            </form>
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-compra-avulsa')">
+                <h3 style="margin:0;">🛠️ Registar Material ou Mão de Obra</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-compra-avulsa" class="collapsible-body">
+                <form method="post" style="margin-top: 15px; display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
+                    <div style="flex:1; min-width:180px;">
+                        <label>Descrição:</label>
+                        <input type="text" name="descricao" required>
+                    </div>
+                    <div style="width:150px;">
+                        <label>Tipo:</label>
+                        <select name="tipo_item">
+                            <option value="Material">Material</option>
+                            <option value="Mão de Obra">Mão de Obra</option>
+                        </select>
+                    </div>
+                    <div style="width:160px;">
+                        <label>Categoria:</label>
+                        <select name="categoria">{cat_select_options}</select>
+                    </div>
+                    <div style="min-width:170px;">
+                        <label>Fornecedor:</label>
+                        <select name="fornecedor_id">
+                            <option value="">Nenhum</option>
+                            {forn_options}
+                        </select>
+                    </div>
+                    <div style="width:105px;">
+                        <label>Unidade:</label>
+                        <select name="unidade">
+                            <option value="un">un</option>
+                            <option value="m">m</option>
+                            <option value="m²">m²</option>
+                            <option value="m³">m³</option>
+                            <option value="sc">sc</option>
+                            <option value="kg">kg</option>
+                            <option value="vb">vb (verba)</option>
+                            <option value="diária">diária</option>
+                        </select>
+                    </div>
+                    <div style="width:110px;">
+                        <label>Qtd:</label>
+                        <input type="text" name="quantidade" required>
+                    </div>
+                    <div style="width:130px;">
+                        <label>Unitário (R$):</label>
+                        <input type="text" name="valor_unitario" required>
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <button type="submit" class="btn">Adicionar</button>
+                    </div>
+                </form>
+            </div>
         </div>
+
+        {blocos_categorias_html}
 
         <div class="card">
-            <h3>Lista Detalhada de Materiais Alocados</h3>
-            <table>
-                <tr><th>Descrição</th><th>Fornecedor</th><th>Unidade</th><th>Quantidade</th><th>Valor Unitário</th><th>Valor Total</th><th>Ações</th></tr>
-                {materiais_rows}
-            </table>
+            <div class="card-header-toggle" onclick="toggleSection(this, 'sec-cronograma')">
+                <h3 style="margin:0;">Cronograma e Medição (Caixa Econômica Federal)</h3>
+                <span class="toggle-arrow">▾ Fechar</span>
+            </div>
+            <div id="sec-cronograma" class="collapsible-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Etapa da Obra</th>
+                            <th>% Executado</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>{etapas_rows}</tbody>
+                </table>
+            </div>
         </div>
-    '''
-    return render_layout(body, active_menu='obra')
+    """
+    return render_layout(body, active_menu="resumo")
 
-@app.route('/excluir_material/<int:material_id>')
+
+@app.route("/excluir_material/<int:material_id>")
+@login_required
 def excluir_material(material_id):
     conn = get_db_connection()
-    material = conn.execute('SELECT obra_id FROM materiais_obra WHERE id = ?', (material_id,)).fetchone()
-    obra_id = material['obra_id'] if material else 1
-    conn.execute('DELETE FROM materiais_obra WHERE id = ?', (material_id,))
+    material = conn.execute(
+        "SELECT obra_id FROM materiais_obra WHERE id = ?", (material_id,)
+    ).fetchone()
+    obra_id = material["obra_id"] if material else 1
+    conn.execute("DELETE FROM materiais_obra WHERE id = ?", (material_id,))
     conn.commit()
     conn.close()
-    return redirect(url_for('detalhe_obra', obra_id=obra_id))
+    return redirect(url_for("detalhe_obra", obra_id=obra_id))
 
-import os
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
