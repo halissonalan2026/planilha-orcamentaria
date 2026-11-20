@@ -13,22 +13,34 @@ from flask import (
     url_for,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "construtora-quality-chave-2026")
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "construtora-quality-chave-2026")
 
-# Credenciais de acesso (pode alterar ou configurar via variável de ambiente)
-USUARIO_LOGIN = os.environ.get("APP_USER", "admin")
-SENHA_LOGIN = os.environ.get("APP_PASS", "quality123")
+# Persistência no Render: usa /var/data quando disponível, com fallback local
+DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.access(DATA_DIR, os.W_OK):
+        DATA_DIR = "."
+except OSError:
+    DATA_DIR = "."
 
-UPLOAD_FOLDER = "static/uploads"
+DB_PATH = os.environ.get("DB_PATH", os.path.join(DATA_DIR, "orcamento_obras.db"))
+UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join(DATA_DIR, "uploads", "pdfs"))
+LOGOS_FOLDER = os.environ.get("LOGOS_FOLDER", os.path.join(DATA_DIR, "uploads", "logos"))
+
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["LOGOS_FOLDER"] = LOGOS_FOLDER
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(LOGOS_FOLDER, exist_ok=True)
+
+EXTENSOES_LOGO = {".png", ".jpg", ".jpeg", ".webp"}
 
 ETAPAS_PADRAO = [
     "Serviços Preliminares e Gerais",
@@ -109,7 +121,8 @@ def parse_moeda(texto):
 
 
 def get_db_connection():
-    conn = sqlite3.connect("orcamento_obras.db")
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -134,33 +147,47 @@ def init_db():
             senha_hash TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pendente',
             vencimento TEXT,
+            nome_empresa TEXT,
+            logo_arquivo TEXT,
             criado_em TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """
     )
+    if not _coluna_existe(cursor, "usuarios", "nome_empresa"):
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN nome_empresa TEXT")
+    if not _coluna_existe(cursor, "usuarios", "logo_arquivo"):
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN logo_arquivo TEXT")
 
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS clientes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario_id INTEGER NOT NULL,
             nome TEXT NOT NULL,
             telefone TEXT,
-            endereco TEXT
+            endereco TEXT,
+            FOREIGN KEY (usuario_id) REFERENCES usuarios (id) ON DELETE CASCADE
         )
     """
     )
+    if not _coluna_existe(cursor, "clientes", "usuario_id"):
+        cursor.execute("ALTER TABLE clientes ADD COLUMN usuario_id INTEGER")
 
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS fornecedores (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario_id INTEGER NOT NULL,
             nome TEXT NOT NULL,
             telefone TEXT,
             material_principal TEXT,
-            tipo_fornecedor TEXT NOT NULL DEFAULT 'Material'
+            tipo_fornecedor TEXT NOT NULL DEFAULT 'Material',
+            FOREIGN KEY (usuario_id) REFERENCES usuarios (id) ON DELETE CASCADE
         )
     """
     )
+    if not _coluna_existe(cursor, "fornecedores", "usuario_id"):
+        cursor.execute("ALTER TABLE fornecedores ADD COLUMN usuario_id INTEGER")
     if not _coluna_existe(cursor, "fornecedores", "tipo_fornecedor"):
         cursor.execute(
             "ALTER TABLE fornecedores ADD COLUMN tipo_fornecedor TEXT NOT NULL DEFAULT 'Material'"
@@ -170,21 +197,26 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS estoque (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario_id INTEGER NOT NULL,
             descricao TEXT NOT NULL,
             fornecedor_id INTEGER,
             unidade TEXT NOT NULL DEFAULT 'un',
             qtd_comprada REAL NOT NULL,
             valor_total_lote REAL NOT NULL,
             valor_unitario REAL GENERATED ALWAYS AS (valor_total_lote / NULLIF(qtd_comprada, 0)) STORED,
+            FOREIGN KEY (usuario_id) REFERENCES usuarios (id) ON DELETE CASCADE,
             FOREIGN KEY (fornecedor_id) REFERENCES fornecedores (id) ON DELETE SET NULL
         )
     """
     )
+    if not _coluna_existe(cursor, "estoque", "usuario_id"):
+        cursor.execute("ALTER TABLE estoque ADD COLUMN usuario_id INTEGER")
 
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS obras (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario_id INTEGER NOT NULL,
             cliente_id INTEGER,
             nome_obra TEXT NOT NULL,
             valor_financiamento REAL DEFAULT 0,
@@ -193,10 +225,13 @@ def init_db():
             metro_quadrado REAL DEFAULT 0,
             valor_m2_usuario REAL DEFAULT 0,
             pdf_projeto TEXT,
+            FOREIGN KEY (usuario_id) REFERENCES usuarios (id) ON DELETE CASCADE,
             FOREIGN KEY (cliente_id) REFERENCES clientes (id) ON DELETE SET NULL
         )
     """
     )
+    if not _coluna_existe(cursor, "obras", "usuario_id"):
+        cursor.execute("ALTER TABLE obras ADD COLUMN usuario_id INTEGER")
     if not _coluna_existe(cursor, "obras", "valor_m2_usuario"):
         cursor.execute("ALTER TABLE obras ADD COLUMN valor_m2_usuario REAL DEFAULT 0")
 
@@ -241,11 +276,17 @@ def init_db():
             "ALTER TABLE materiais_obra ADD COLUMN tipo_item TEXT NOT NULL DEFAULT 'Material'"
         )
 
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_clientes_usuario ON clientes (usuario_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_fornecedores_usuario ON fornecedores (usuario_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_estoque_usuario ON estoque (usuario_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_obras_usuario ON obras (usuario_id)")
+
     conn.commit()
     conn.close()
 
 
 init_db()
+
 
 def normalizar_whatsapp(fone):
     digitos = re.sub(r"\D", "", fone or "")
@@ -265,11 +306,15 @@ def montar_mensagem_cobranca(nome, vencimento):
     )
 
 
+def current_usuario_id():
+    return session.get("usuario_id")
+
+
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if session.get("is_admin"):
-            return f(*args, **kwargs)
+            return redirect(url_for("admin_painel"))
         if not session.get("usuario_id"):
             return redirect(url_for("login", next=request.path))
         if session.get("status_usuario") != "ativo":
@@ -289,18 +334,8 @@ def admin_required(f):
     return decorated
 
 
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get("logado"):
-            return redirect(url_for("login", next=request.path))
-        return f(*args, **kwargs)
-
-    return decorated
-
-
 BASE_CSS = """
-    * { box-sizing: border-box; }
+* { box-sizing: border-box; }
     body {
         font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         margin: 0;
@@ -308,6 +343,34 @@ BASE_CSS = """
         color: #e2e8f0;
         display: flex;
         min-height: 100vh;
+    }
+    .watermark-had {
+        position: fixed;
+        right: 18px;
+        bottom: 14px;
+        font-family: 'Montserrat', 'Inter', 'Segoe UI', system-ui, sans-serif;
+        font-size: 13px;
+        font-weight: 500;
+        letter-spacing: 0.28em;
+        color: #e2e8f0;
+        opacity: 0.14;
+        pointer-events: none;
+        user-select: none;
+        z-index: 9999;
+    }
+    .logo-placeholder-had {
+        width: 42px;
+        height: 42px;
+        border-radius: 6px;
+        background: #1a1e29;
+        border: 1px dashed #4a5568;
+        color: #a0aec0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+        font-weight: 700;
+        flex-shrink: 0;
     }
     .sidebar {
         width: 260px;
@@ -605,20 +668,6 @@ BASE_CSS = """
     a.voltar:hover {
         text-decoration: underline;
     }
-    .progress-bar-container {
-        background: #2d3748;
-        border-radius: 4px;
-        overflow: hidden;
-        width: 90px;
-        height: 8px;
-        display: inline-block;
-        vertical-align: middle;
-        margin-right: 8px;
-    }
-    .progress-bar-fill {
-        background: #d4af37;
-        height: 100%;
-    }
     hr {
         border: 0;
         border-top: 1px solid #2d3748;
@@ -659,6 +708,12 @@ BASE_CSS = """
     }
 
     @media (max-width: 768px) {
+        .watermark-had {
+            font-size: 11px;
+            right: 12px;
+            bottom: 10px;
+            letter-spacing: 0.22em;
+        }
         .sidebar {
             width: 100%;
             height: auto;
@@ -669,9 +724,10 @@ BASE_CSS = """
             padding: 12px 15px;
             justify-content: space-between;
         }
-        .sidebar-header img {
+        .sidebar-header img, .logo-placeholder-had {
             width: 32px;
             height: 32px;
+            font-size: 14px;
         }
         .sidebar-header h2 {
             font-size: 12px;
@@ -757,22 +813,57 @@ document.addEventListener('DOMContentLoaded', function () {
 """
 
 
-def render_layout(body_content, active_menu="resumo"):
+def obter_branding_usuario(conn=None):
+    nome_empresa = ""
+    logo_url = ""
+
+    uid = current_usuario_id()
+    if uid:
+        fechar_conn = False
+        if conn is None:
+            conn = get_db_connection()
+            fechar_conn = True
+        row = conn.execute(
+            "SELECT nome_empresa, logo_arquivo FROM usuarios WHERE id = ?", (uid,)
+        ).fetchone()
+        if fechar_conn:
+            conn.close()
+
+        if row:
+            if (row["nome_empresa"] or "").strip():
+                nome_empresa = row["nome_empresa"].strip()
+            if (row["logo_arquivo"] or "").strip():
+                logo_url = url_for(
+                    "uploaded_logo", filename=os.path.basename(row["logo_arquivo"])
+                )
+
+    return nome_empresa, logo_url
+
+
+def render_layout(body_content, active_menu="resumo", nome_empresa=None, logo_url=None):
     menu_active = {
         "resumo": "",
         "clientes": "",
         "obra": "",
         "fornecedores": "",
         "estoque": "",
+        "empresa": "",
     }
     if active_menu in menu_active:
         menu_active[active_menu] = "active"
 
-    admin_link = (
-        '<li><a href="/admin">🛡️ <span>Admin</span></a></li>'
-        if session.get("is_admin")
-        else ""
+    if nome_empresa is None or logo_url is None:
+        empresa_padrao, logo_padrao = obter_branding_usuario()
+        nome_empresa = empresa_padrao if nome_empresa is None else nome_empresa
+        logo_url = logo_padrao if logo_url is None else logo_url
+
+    titulo_exibicao = nome_empresa.strip() if (nome_empresa or "").strip() else "?"
+    logo_html = (
+        f'<img src="{logo_url}" alt="Logo">'
+        if (logo_url or "").strip()
+        else '<div class="logo-placeholder-had">?</div>'
     )
+    nome_usuario = session.get("nome_usuario") or "Profissional"
 
     return render_template_string(
         f"""
@@ -781,15 +872,15 @@ def render_layout(body_content, active_menu="resumo"):
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Construtora Quality - Painel de Engenharia</title>
+            <title>{titulo_exibicao} - Gestão de Obras</title>
             <style>{BASE_CSS}</style>
         </head>
         <body>
             <div class="sidebar">
                 <div class="sidebar-header">
                     <div style="display:flex; align-items:center; gap:12px;">
-                        <img src="/static/logo.jpg" alt="Logo">
-                        <h2>CONSTRUTORA QUALITY</h2>
+                        {logo_html}
+                        <h2>{titulo_exibicao}</h2>
                     </div>
                     <a href="/logout" class="mobile-logout-link">Sair</a>
                 </div>
@@ -799,7 +890,7 @@ def render_layout(body_content, active_menu="resumo"):
                     <li><a href="/nova_obra" class="{menu_active['obra']}">🏗️ <span>Registar</span></a></li>
                     <li><a href="/fornecedores" class="{menu_active['fornecedores']}">🤝 <span>Fornecedores</span></a></li>
                     <li><a href="/estoque" class="{menu_active['estoque']}">📦 <span>Estoque</span></a></li>
-                    {admin_link}
+                    <li><a href="/minha_empresa" class="{menu_active['empresa']}">🏢 <span>Minha Empresa</span></a></li>
                 </ul>
                 <div class="sidebar-footer">
                     <a href="/logout">🚪 Sair do Sistema</a>
@@ -810,18 +901,20 @@ def render_layout(body_content, active_menu="resumo"):
                 <div class="top-navbar">
                     <span style="font-weight: 600; font-size: 13px; letter-spacing: 0.5px; color: #d4af37;">GESTÃO DE OBRAS</span>
                     <div class="user-info">
-                        <span style="font-size: 13px;">Quality ▾</span>
+                        <span style="font-size: 13px;">{nome_usuario} ▾</span>
                     </div>
                 </div>
                 <div class="content-area">
                     {body_content}
                 </div>
             </div>
+            <div class="watermark-had">HAD</div>
             {TOGGLE_SCRIPT}
         </body>
         </html>
     """
     )
+
 
 @app.route("/cadastro", methods=["GET", "POST"])
 def cadastro():
@@ -875,18 +968,15 @@ def cadastro():
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Cadastro - Construtora Quality</title>
+            <title>Cadastro - Gestão de Obras</title>
             <style>{BASE_CSS}</style>
         </head>
         <body>
             <div class="login-container">
                 <div class="login-box">
-                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:20px; border-bottom:1px solid #2d3748; padding-bottom:15px;">
-                        <img src="/static/logo.jpg" alt="Logo" style="width:44px; height:44px; border-radius:6px; object-fit:cover; border:1px solid #d4af37;">
-                        <div>
-                            <h2 style="margin:0; font-size:16px; color:#d4af37;">SOLICITAR ACESSO</h2>
-                            <span style="font-size:12px; color:#a0aec0;">Cadastro de Profissional</span>
-                        </div>
+                    <div style="margin-bottom:20px; border-bottom:1px solid #2d3748; padding-bottom:15px;">
+                        <h2 style="margin:0; font-size:16px; color:#d4af37;">SOLICITAR ACESSO</h2>
+                        <span style="font-size:12px; color:#a0aec0;">Cadastro de Profissional</span>
                     </div>
                     {alerta_html}
                     <form method="POST">
@@ -909,6 +999,7 @@ def cadastro():
                     </div>
                 </div>
             </div>
+            <div class="watermark-had">HAD</div>
         </body>
         </html>
     """
@@ -979,18 +1070,15 @@ def login():
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Login - Construtora Quality</title>
+            <title>Login - Gestão de Obras</title>
             <style>{BASE_CSS}</style>
         </head>
         <body>
             <div class="login-container">
                 <div class="login-box">
-                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:20px; border-bottom:1px solid #2d3748; padding-bottom:15px;">
-                        <img src="/static/logo.jpg" alt="Logo" style="width:44px; height:44px; border-radius:6px; object-fit:cover; border:1px solid #d4af37;">
-                        <div>
-                            <h2 style="margin:0; font-size:16px; color:#d4af37;">CONSTRUTORA QUALITY</h2>
-                            <span style="font-size:12px; color:#a0aec0;">Acesso ao Painel de Gestão</span>
-                        </div>
+                    <div style="margin-bottom:20px; border-bottom:1px solid #2d3748; padding-bottom:15px;">
+                        <h2 style="margin:0; font-size:16px; color:#d4af37;">GESTÃO DE OBRAS</h2>
+                        <span style="font-size:12px; color:#a0aec0;">Acesso ao Painel</span>
                     </div>
                     {aviso_html}
                     <form method="POST">
@@ -1006,14 +1094,18 @@ def login():
                     </div>
                 </div>
             </div>
+            <div class="watermark-had">HAD</div>
         </body>
         </html>
     """
     )
+
+
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
 
 @app.route("/admin", methods=["GET", "POST"])
 @admin_required
@@ -1056,6 +1148,12 @@ def admin_painel():
             else:
                 badge = '<span style="color:#f6e05e; font-weight:700;">Em Análise</span>'
 
+            empresa_txt = (u["nome_empresa"] or "").strip()
+            sub_info = (
+                f"@{u['usuario']} · {empresa_txt}"
+                if empresa_txt
+                else f"@{u['usuario']}"
+            )
             msg_cobranca = montar_mensagem_cobranca(u["nome"], u["vencimento"])
             msg_escapada = (
                 msg_cobranca.replace("\\", "\\\\")
@@ -1071,7 +1169,10 @@ def admin_painel():
 
             rows_html += f"""
                 <tr>
-                    <td><strong style="color:#fff;">{u["nome"]}</strong><br><span style="font-size:11px; color:#a0aec0;">@{u["usuario"]}</span></td>
+                    <td>
+                        <strong style="color:#fff;">{u["nome"]}</strong><br>
+                        <span style="font-size:11px; color:#a0aec0;">{sub_info}</span>
+                    </td>
                     <td>{u["whatsapp"]}</td>
                     <td>{badge}</td>
                     <td>
@@ -1102,77 +1203,251 @@ def admin_painel():
     else:
         rows_html = '<tr><td colspan="5" style="text-align:center; color:#a0aec0;">Nenhum profissional cadastrado ainda.</td></tr>'
 
+    return render_template_string(
+        f"""
+        <!DOCTYPE html>
+        <html lang="pt-br">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Administração - Controle de Acessos</title>
+            <style>{BASE_CSS}</style>
+        </head>
+        <body>
+            <div class="main-wrapper" style="margin-left:0; width:100%;">
+                <div class="top-navbar">
+                    <span style="font-weight: 600; font-size: 13px; letter-spacing: 0.5px; color: #d4af37;">PAINEL ADMINISTRATIVO</span>
+                    <div class="user-info">
+                        <a href="/logout" class="btn-excluir" style="margin:0;">Sair</a>
+                    </div>
+                </div>
+                <div class="content-area">
+                    <div class="top-bar-title">
+                        <div>
+                            <h1>Controle de Assinaturas e Acessos</h1>
+                            <p>Aprovação de cadastros, bloqueio por pendência, vencimento e cobrança via WhatsApp.</p>
+                        </div>
+                    </div>
+
+                    <div class="card" id="box-cobranca" style="display:none; border-left: 5px solid #d4af37;">
+                        <h3 style="margin-top:0;">Mensagem Amigável de Cobrança (<span id="cob-nome"></span>)</h3>
+                        <textarea id="cob-texto" rows="4" style="width:100%; background:#111318; color:#fff; border:1px solid #2d3748; border-radius:6px; padding:10px; font-size:13px;"></textarea>
+                        <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:12px;">
+                            <button type="button" class="btn" onclick="copiarCobranca()">Copiar Mensagem</button>
+                            <a id="cob-wa-link" href="#" target="_blank" class="btn btn-secundario">Abrir no WhatsApp</a>
+                            <button type="button" class="btn-detalhe" onclick="document.getElementById('box-cobranca').style.display='none'">Fechar</button>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h3 style="margin-top:0;">Profissionais Cadastrados</h3>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Profissional</th>
+                                    <th>WhatsApp</th>
+                                    <th>Status</th>
+                                    <th>Vencimento</th>
+                                    <th>Ações</th>
+                                </tr>
+                            </thead>
+                            <tbody>{rows_html}</tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div class="watermark-had">HAD</div>
+
+            <script>
+            function prepararCobranca(nome, msg, waLink) {{
+                document.getElementById('cob-nome').textContent = nome;
+                document.getElementById('cob-texto').value = msg;
+                const linkEl = document.getElementById('cob-wa-link');
+                linkEl.href = waLink;
+                linkEl.style.display = waLink && waLink !== '#' ? 'inline-block' : 'none';
+                const box = document.getElementById('box-cobranca');
+                box.style.display = 'block';
+                box.scrollIntoView({{ behavior: 'smooth' }});
+            }}
+
+            function copiarCobranca() {{
+                const txt = document.getElementById('cob-texto');
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                    navigator.clipboard.writeText(txt.value).then(() => {{
+                        alert('Mensagem copiada! Agora é só colar e enviar no WhatsApp.');
+                    }}).catch(() => {{
+                        txt.select();
+                        document.execCommand('copy');
+                        alert('Mensagem copiada! Agora é só colar e enviar no WhatsApp.');
+                    }});
+                }} else {{
+                    txt.select();
+                    document.execCommand('copy');
+                    alert('Mensagem copiada! Agora é só colar e enviar no WhatsApp.');
+                }}
+            }}
+            </script>
+        </body>
+        </html>
+    """
+    )
+
+
+@app.route("/logos/<filename>")
+@login_required
+def uploaded_logo(filename):
+    uid = current_usuario_id()
+    safe_name = os.path.basename(filename)
+    conn = get_db_connection()
+    user_row = conn.execute(
+        "SELECT id FROM usuarios WHERE id = ? AND logo_arquivo = ?",
+        (uid, safe_name),
+    ).fetchone()
+    conn.close()
+    if not user_row:
+        return redirect(url_for("index"))
+    return send_from_directory(app.config["LOGOS_FOLDER"], safe_name)
+
+
+@app.route("/minha_empresa", methods=["GET", "POST"])
+@login_required
+def minha_empresa():
+    uid = current_usuario_id()
+    conn = get_db_connection()
+    user_row = conn.execute(
+        "SELECT id, nome_empresa, logo_arquivo FROM usuarios WHERE id = ?", (uid,)
+    ).fetchone()
+
+    if not user_row:
+        conn.close()
+        return redirect(url_for("login"))
+
+    mensagem = ""
+    erro = ""
+
+    if request.method == "POST":
+        novo_nome_empresa = (request.form.get("nome_empresa") or "").strip()
+        logo_atual = user_row["logo_arquivo"]
+
+        if request.form.get("limpar_identidade") == "1":
+            if logo_atual:
+                caminho_antigo = os.path.join(
+                    app.config["LOGOS_FOLDER"], os.path.basename(logo_atual)
+                )
+                if os.path.exists(caminho_antigo):
+                    try:
+                        os.remove(caminho_antigo)
+                    except OSError:
+                        pass
+            novo_nome_empresa = ""
+            logo_atual = None
+
+        elif "logo_arquivo" in request.files:
+            arquivo = request.files["logo_arquivo"]
+            if arquivo and arquivo.filename:
+                ext = os.path.splitext(arquivo.filename)[1].lower()
+                if ext not in EXTENSOES_LOGO:
+                    erro = "Envie uma imagem válida em PNG, JPG, JPEG ou WEBP."
+                else:
+                    safe_base = (
+                        secure_filename(
+                            os.path.splitext(os.path.basename(arquivo.filename))[0]
+                        )
+                        or "logo"
+                    )
+                    nome_salvo = f"u{uid}_{safe_base}{ext}"
+                    arquivo.save(os.path.join(app.config["LOGOS_FOLDER"], nome_salvo))
+                    logo_atual = nome_salvo
+
+        if not erro:
+            valor_empresa_db = novo_nome_empresa if novo_nome_empresa else None
+            conn.execute(
+                "UPDATE usuarios SET nome_empresa = ?, logo_arquivo = ? WHERE id = ?",
+                (valor_empresa_db, logo_atual, uid),
+            )
+            conn.commit()
+            mensagem = "Identidade da empresa atualizada com sucesso."
+
+    conn.close()
+
+    empresa_exibida, logo_exibida = obter_branding_usuario()
+    nome_exibicao = empresa_exibida if empresa_exibida else "?"
+    logo_preview_html = (
+        f'<img src="{logo_exibida}" alt="Logo Atual" style="width:52px; height:52px; border-radius:6px; object-fit:cover; border:1px solid #d4af37;">'
+        if logo_exibida
+        else '<div class="logo-placeholder-had" style="width:52px; height:52px; font-size:18px;">?</div>'
+    )
+    aviso_pendente_html = ""
+    if not empresa_exibida or not logo_exibida:
+        aviso_pendente_html = (
+            '<div style="background:rgba(212,175,55,0.12); border:1px dashed #d4af37; color:#f6e05e; '
+            'padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:12px;">'
+            '<strong>? Identidade não configurada:</strong> Defina o nome da sua empresa/escritório e envie seu logotipo abaixo.'
+            '</div>'
+        )
+
+    alerta_html = ""
+    if erro:
+        alerta_html = f'<div style="background:rgba(231,76,60,0.18); color:#fc8181; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{erro}</div>'
+    elif mensagem:
+        alerta_html = f'<div style="background:rgba(72,187,120,0.18); color:#68d391; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{mensagem}</div>'
+
     body = f"""
         <a href="/" class="voltar">← Voltar para o Início</a>
-        <div class="top-bar-title">
-            <div>
-                <h1>Painel do Administrador</h1>
-                <p>Controle de acessos, mensalidades e mensagens amigáveis de cobrança.</p>
+        <div class="card" style="max-width: 650px;">
+            <h2 style="margin-top:0;">Identidade da Empresa</h2>
+            <p style="color:#a0aec0; font-size:13px;">Personalize o nome e o logotipo exibidos no seu painel operacional.</p>
+            {alerta_html}
+            {aviso_pendente_html}
+
+            <div style="display:flex; align-items:center; gap:14px; padding:14px; background:#111318; border:1px solid #2d3748; border-radius:8px; margin-bottom:18px;">
+                {logo_preview_html}
+                <div>
+                    <div style="font-size:11px; color:#a0aec0; text-transform:uppercase;">Exibição Atual</div>
+                    <div style="font-size:15px; font-weight:700; color:#d4af37;">{nome_exibicao}</div>
+                </div>
             </div>
+
+            <form method="post" enctype="multipart/form-data">
+                <label>Nome da Empresa / Escritório:</label>
+                <input type="text" name="nome_empresa" value="{empresa_exibida}" placeholder="Ex: Nome da sua empresa ou escritório">
+
+                <label>Logotipo (PNG, JPG, JPEG ou WEBP):</label>
+                <input type="file" name="logo_arquivo" accept=".png,.jpg,.jpeg,.webp">
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+                    <button type="submit" class="btn">Salvar Identidade</button>
+                </div>
+            </form>
+
+            <form method="post" style="margin-top:14px;">
+                <input type="hidden" name="limpar_identidade" value="1">
+                <button type="submit" class="btn btn-secundario">Limpar Identidade (?)</button>
+            </form>
         </div>
-
-        <div class="card" id="box-cobranca" style="display:none; border-left: 5px solid #d4af37;">
-            <h3 style="margin-top:0;">Mensagem Amigável de Cobrança (<span id="cob-nome"></span>)</h3>
-            <textarea id="cob-texto" rows="4" style="width:100%; background:#111318; color:#fff; border:1px solid #2d3748; border-radius:6px; padding:10px; font-size:13px;"></textarea>
-            <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:12px;">
-                <button type="button" class="btn" onclick="copiarCobranca()">Copiar Mensagem</button>
-                <a id="cob-wa-link" href="#" target="_blank" class="btn btn-secundario">Abrir no WhatsApp</a>
-                <button type="button" class="btn-detalhe" onclick="document.getElementById('box-cobranca').style.display='none'">Fechar</button>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3 style="margin-top:0;">Profissionais Cadastrados</h3>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Profissional</th>
-                        <th>WhatsApp</th>
-                        <th>Status</th>
-                        <th>Vencimento</th>
-                        <th>Ações</th>
-                    </tr>
-                </thead>
-                <tbody>{rows_html}</tbody>
-            </table>
-        </div>
-
-        <script>
-        function prepararCobranca(nome, msg, waLink) {{
-            document.getElementById('cob-nome').textContent = nome;
-            document.getElementById('cob-texto').value = msg;
-            const linkEl = document.getElementById('cob-wa-link');
-            linkEl.href = waLink;
-            linkEl.style.display = waLink && waLink !== '#' ? 'inline-block' : 'none';
-            const box = document.getElementById('box-cobranca');
-            box.style.display = 'block';
-            box.scrollIntoView({{ behavior: 'smooth' }});
-        }}
-
-        function copiarCobranca() {{
-            const txt = document.getElementById('cob-texto');
-            txt.select();
-            document.execCommand('copy');
-            alert('Mensagem copiada! Agora é só colar e enviar no WhatsApp.');
-        }}
-        </script>
     """
-    return render_layout(body, active_menu="resumo")
-
-    
+    return render_layout(
+        body,
+        active_menu="empresa",
+        nome_empresa=empresa_exibida,
+        logo_url=logo_exibida,
+    )
 
 
 @app.route("/")
 @login_required
 def index():
+    uid = current_usuario_id()
     conn = get_db_connection()
     obras_cursor = conn.execute(
         """
         SELECT obras.*, clientes.nome as cliente_nome
         FROM obras
-        LEFT JOIN clientes ON obras.cliente_id = clientes.id
+        LEFT JOIN clientes ON obras.cliente_id = clientes.id AND clientes.usuario_id = obras.usuario_id
+        WHERE obras.usuario_id = ?
         ORDER BY obras.id DESC
-    """
+    """,
+        (uid,),
     ).fetchall()
 
     obras = []
@@ -1292,6 +1567,7 @@ def index():
 @app.route("/novo_cliente", methods=["GET", "POST"])
 @login_required
 def novo_cliente():
+    uid = current_usuario_id()
     conn = get_db_connection()
     if request.method == "POST":
         nome = request.form["nome"].strip()
@@ -1299,14 +1575,16 @@ def novo_cliente():
         endereco = request.form["endereco"].strip()
 
         conn.execute(
-            "INSERT INTO clientes (nome, telefone, endereco) VALUES (?, ?, ?)",
-            (nome, telefone, endereco),
+            "INSERT INTO clientes (usuario_id, nome, telefone, endereco) VALUES (?, ?, ?, ?)",
+            (uid, nome, telefone, endereco),
         )
         conn.commit()
         conn.close()
         return redirect(url_for("novo_cliente"))
 
-    clientes = conn.execute("SELECT * FROM clientes ORDER BY id DESC").fetchall()
+    clientes = conn.execute(
+        "SELECT * FROM clientes WHERE usuario_id = ? ORDER BY id DESC", (uid,)
+    ).fetchall()
     conn.close()
 
     cli_rows = ""
@@ -1367,9 +1645,18 @@ def novo_cliente():
 @app.route("/nova_obra", methods=["GET", "POST"])
 @login_required
 def nova_obra():
+    uid = current_usuario_id()
     conn = get_db_connection()
     if request.method == "POST":
         cliente_id = request.form.get("cliente_id") or None
+        if cliente_id:
+            cli_ok = conn.execute(
+                "SELECT id FROM clientes WHERE id = ? AND usuario_id = ?",
+                (cliente_id, uid),
+            ).fetchone()
+            if not cli_ok:
+                cliente_id = None
+
         nome_obra = request.form["nome_obra"].strip()
         valor_financiamento = parse_moeda(request.form.get("valor_financiamento"))
         valor_entrada = parse_moeda(request.form.get("valor_entrada"))
@@ -1381,20 +1668,22 @@ def nova_obra():
         if "pdf_projeto" in request.files:
             file = request.files["pdf_projeto"]
             if file and file.filename and file.filename.lower().endswith(".pdf"):
-                safe_name = os.path.basename(file.filename)
-                pdf_filename = safe_name
-                file.save(os.path.join(app.config["UPLOAD_FOLDER"], pdf_filename))
+                safe_name = secure_filename(os.path.basename(file.filename))
+                if safe_name:
+                    pdf_filename = f"u{uid}_{safe_name}"
+                    file.save(os.path.join(app.config["UPLOAD_FOLDER"], pdf_filename))
 
         cursor = conn.cursor()
         cursor.execute(
             """
             INSERT INTO obras (
-                cliente_id, nome_obra, valor_financiamento, valor_entrada,
+                usuario_id, cliente_id, nome_obra, valor_financiamento, valor_entrada,
                 valor_terreno, metro_quadrado, valor_m2_usuario, pdf_projeto
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
+                uid,
                 cliente_id,
                 nome_obra,
                 valor_financiamento,
@@ -1417,7 +1706,9 @@ def nova_obra():
         conn.close()
         return redirect(url_for("index"))
 
-    clientes = conn.execute("SELECT * FROM clientes ORDER BY nome").fetchall()
+    clientes = conn.execute(
+        "SELECT * FROM clientes WHERE usuario_id = ? ORDER BY nome", (uid,)
+    ).fetchall()
     conn.close()
 
     options = "".join(
@@ -1471,14 +1762,25 @@ def nova_obra():
 @app.route("/editar_obra/<int:obra_id>", methods=["GET", "POST"])
 @login_required
 def editar_obra(obra_id):
+    uid = current_usuario_id()
     conn = get_db_connection()
-    obra = conn.execute("SELECT * FROM obras WHERE id = ?", (obra_id,)).fetchone()
+    obra = conn.execute(
+        "SELECT * FROM obras WHERE id = ? AND usuario_id = ?", (obra_id, uid)
+    ).fetchone()
     if not obra:
         conn.close()
         return redirect(url_for("index"))
 
     if request.method == "POST":
         cliente_id = request.form.get("cliente_id") or None
+        if cliente_id:
+            cli_ok = conn.execute(
+                "SELECT id FROM clientes WHERE id = ? AND usuario_id = ?",
+                (cliente_id, uid),
+            ).fetchone()
+            if not cli_ok:
+                cliente_id = None
+
         nome_obra = request.form["nome_obra"].strip()
         valor_financiamento = parse_moeda(request.form.get("valor_financiamento"))
         valor_entrada = parse_moeda(request.form.get("valor_entrada"))
@@ -1490,15 +1792,17 @@ def editar_obra(obra_id):
         if "pdf_projeto" in request.files:
             file = request.files["pdf_projeto"]
             if file and file.filename and file.filename.lower().endswith(".pdf"):
-                pdf_filename = os.path.basename(file.filename)
-                file.save(os.path.join(app.config["UPLOAD_FOLDER"], pdf_filename))
+                safe_name = secure_filename(os.path.basename(file.filename))
+                if safe_name:
+                    pdf_filename = f"u{uid}_{safe_name}"
+                    file.save(os.path.join(app.config["UPLOAD_FOLDER"], pdf_filename))
 
         conn.execute(
             """
             UPDATE obras
             SET cliente_id = ?, nome_obra = ?, valor_financiamento = ?, valor_entrada = ?,
                 valor_terreno = ?, metro_quadrado = ?, valor_m2_usuario = ?, pdf_projeto = ?
-            WHERE id = ?
+            WHERE id = ? AND usuario_id = ?
         """,
             (
                 cliente_id,
@@ -1510,13 +1814,16 @@ def editar_obra(obra_id):
                 valor_m2_usuario,
                 pdf_filename,
                 obra_id,
+                uid,
             ),
         )
         conn.commit()
         conn.close()
         return redirect(url_for("detalhe_obra", obra_id=obra_id))
 
-    clientes = conn.execute("SELECT * FROM clientes ORDER BY nome").fetchall()
+    clientes = conn.execute(
+        "SELECT * FROM clientes WHERE usuario_id = ? ORDER BY nome", (uid,)
+    ).fetchall()
     conn.close()
 
     options = "".join(
@@ -1571,11 +1878,16 @@ def editar_obra(obra_id):
 @app.route("/excluir_obra/<int:obra_id>")
 @login_required
 def excluir_obra(obra_id):
+    uid = current_usuario_id()
     conn = get_db_connection()
-    conn.execute("DELETE FROM materiais_obra WHERE obra_id = ?", (obra_id,))
-    conn.execute("DELETE FROM etapas_obra WHERE obra_id = ?", (obra_id,))
-    conn.execute("DELETE FROM obras WHERE id = ?", (obra_id,))
-    conn.commit()
+    obra = conn.execute(
+        "SELECT id FROM obras WHERE id = ? AND usuario_id = ?", (obra_id, uid)
+    ).fetchone()
+    if obra:
+        conn.execute("DELETE FROM materiais_obra WHERE obra_id = ?", (obra_id,))
+        conn.execute("DELETE FROM etapas_obra WHERE obra_id = ?", (obra_id,))
+        conn.execute("DELETE FROM obras WHERE id = ? AND usuario_id = ?", (obra_id, uid))
+        conn.commit()
     conn.close()
     return redirect(url_for("index"))
 
@@ -1583,6 +1895,7 @@ def excluir_obra(obra_id):
 @app.route("/fornecedores", methods=["GET", "POST"])
 @login_required
 def fornecedores():
+    uid = current_usuario_id()
     conn = get_db_connection()
     if request.method == "POST":
         nome = request.form["nome"].strip()
@@ -1594,17 +1907,17 @@ def fornecedores():
 
         conn.execute(
             """
-            INSERT INTO fornecedores (nome, telefone, material_principal, tipo_fornecedor)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO fornecedores (usuario_id, nome, telefone, material_principal, tipo_fornecedor)
+            VALUES (?, ?, ?, ?, ?)
         """,
-            (nome, telefone, material_principal, tipo_fornecedor),
+            (uid, nome, telefone, material_principal, tipo_fornecedor),
         )
         conn.commit()
         conn.close()
         return redirect(url_for("fornecedores"))
 
     fornecedores_lista = conn.execute(
-        "SELECT * FROM fornecedores ORDER BY id DESC"
+        "SELECT * FROM fornecedores WHERE usuario_id = ? ORDER BY id DESC", (uid,)
     ).fetchall()
     conn.close()
 
@@ -1712,13 +2025,22 @@ def fornecedores():
 @app.route("/excluir_fornecedor/<int:fornecedor_id>")
 @login_required
 def excluir_fornecedor(fornecedor_id):
+    uid = current_usuario_id()
     conn = get_db_connection()
-    conn.execute(
-        "UPDATE materiais_obra SET fornecedor_id = NULL WHERE fornecedor_id = ?",
-        (fornecedor_id,),
-    )
-    conn.execute("DELETE FROM fornecedores WHERE id = ?", (fornecedor_id,))
-    conn.commit()
+    forn = conn.execute(
+        "SELECT id FROM fornecedores WHERE id = ? AND usuario_id = ?",
+        (fornecedor_id, uid),
+    ).fetchone()
+    if forn:
+        conn.execute(
+            "UPDATE materiais_obra SET fornecedor_id = NULL WHERE fornecedor_id = ?",
+            (fornecedor_id,),
+        )
+        conn.execute(
+            "DELETE FROM fornecedores WHERE id = ? AND usuario_id = ?",
+            (fornecedor_id, uid),
+        )
+        conn.commit()
     conn.close()
     return redirect(url_for("fornecedores"))
 
@@ -1726,10 +2048,19 @@ def excluir_fornecedor(fornecedor_id):
 @app.route("/estoque", methods=["GET", "POST"])
 @login_required
 def estoque():
+    uid = current_usuario_id()
     conn = get_db_connection()
     if request.method == "POST":
         descricao = request.form["descricao"].strip()
         fornecedor_id = request.form.get("fornecedor_id") or None
+        if fornecedor_id:
+            forn_ok = conn.execute(
+                "SELECT id FROM fornecedores WHERE id = ? AND usuario_id = ?",
+                (fornecedor_id, uid),
+            ).fetchone()
+            if not forn_ok:
+                fornecedor_id = None
+
         unidade = request.form.get("unidade") or "un"
         qtd_comprada = parse_moeda(request.form.get("qtd_comprada"))
         valor_total_lote = parse_moeda(request.form.get("valor_total_lote"))
@@ -1737,10 +2068,10 @@ def estoque():
         if qtd_comprada > 0:
             conn.execute(
                 """
-                INSERT INTO estoque (descricao, fornecedor_id, unidade, qtd_comprada, valor_total_lote)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO estoque (usuario_id, descricao, fornecedor_id, unidade, qtd_comprada, valor_total_lote)
+                VALUES (?, ?, ?, ?, ?, ?)
             """,
-                (descricao, fornecedor_id, unidade, qtd_comprada, valor_total_lote),
+                (uid, descricao, fornecedor_id, unidade, qtd_comprada, valor_total_lote),
             )
             conn.commit()
         conn.close()
@@ -1750,9 +2081,11 @@ def estoque():
         """
         SELECT estoque.*, fornecedores.nome as fornecedor_nome
         FROM estoque
-        LEFT JOIN fornecedores ON estoque.fornecedor_id = fornecedores.id
+        LEFT JOIN fornecedores ON estoque.fornecedor_id = fornecedores.id AND fornecedores.usuario_id = estoque.usuario_id
+        WHERE estoque.usuario_id = ?
         ORDER BY estoque.id DESC
-    """
+    """,
+        (uid,),
     ).fetchall()
 
     itens_estoque = []
@@ -1766,14 +2099,18 @@ def estoque():
         saldo_atual = float(item["qtd_comprada"] or 0.0) - usado
 
         if saldo_atual <= 0:
-            conn.execute("DELETE FROM estoque WHERE id = ?", (item["id"],))
+            conn.execute(
+                "DELETE FROM estoque WHERE id = ? AND usuario_id = ?",
+                (item["id"], uid),
+            )
             conn.commit()
         else:
             item_dict["saldo_atual"] = saldo_atual
             itens_estoque.append(item_dict)
 
     fornecedores = conn.execute(
-        "SELECT * FROM fornecedores WHERE tipo_fornecedor = 'Material' OR tipo_fornecedor IS NULL ORDER BY nome"
+        "SELECT * FROM fornecedores WHERE usuario_id = ? AND (tipo_fornecedor = 'Material' OR tipo_fornecedor IS NULL) ORDER BY nome",
+        (uid,),
     ).fetchall()
     conn.close()
 
@@ -1873,8 +2210,11 @@ def estoque():
 @app.route("/excluir_estoque/<int:estoque_id>")
 @login_required
 def excluir_estoque(estoque_id):
+    uid = current_usuario_id()
     conn = get_db_connection()
-    conn.execute("DELETE FROM estoque WHERE id = ?", (estoque_id,))
+    conn.execute(
+        "DELETE FROM estoque WHERE id = ? AND usuario_id = ?", (estoque_id, uid)
+    )
     conn.commit()
     conn.close()
     return redirect(url_for("estoque"))
@@ -1883,15 +2223,32 @@ def excluir_estoque(estoque_id):
 @app.route("/uploads/<filename>")
 @login_required
 def uploaded_file(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    uid = current_usuario_id()
+    safe_name = os.path.basename(filename)
+    conn = get_db_connection()
+    obra = conn.execute(
+        "SELECT id FROM obras WHERE pdf_projeto = ? AND usuario_id = ?",
+        (safe_name, uid),
+    ).fetchone()
+    conn.close()
+    if not obra:
+        return redirect(url_for("index"))
+    return send_from_directory(app.config["UPLOAD_FOLDER"], safe_name)
 
 
 @app.route("/editar_material/<int:material_id>", methods=["GET", "POST"])
 @login_required
 def editar_material(material_id):
+    uid = current_usuario_id()
     conn = get_db_connection()
     item = conn.execute(
-        "SELECT * FROM materiais_obra WHERE id = ?", (material_id,)
+        """
+        SELECT materiais_obra.*
+        FROM materiais_obra
+        JOIN obras ON materiais_obra.obra_id = obras.id
+        WHERE materiais_obra.id = ? AND obras.usuario_id = ?
+    """,
+        (material_id, uid),
     ).fetchone()
     if not item:
         conn.close()
@@ -1908,13 +2265,22 @@ def editar_material(material_id):
         if tipo_item not in ("Material", "Mão de Obra"):
             tipo_item = "Material"
         fornecedor_id = request.form.get("fornecedor_id") or None
+        if fornecedor_id:
+            forn_ok = conn.execute(
+                "SELECT id FROM fornecedores WHERE id = ? AND usuario_id = ?",
+                (fornecedor_id, uid),
+            ).fetchone()
+            if not forn_ok:
+                fornecedor_id = None
+
         unidade = request.form.get("unidade") or "un"
         quantidade = parse_moeda(request.form.get("quantidade"))
         valor_unitario = parse_moeda(request.form.get("valor_unitario"))
 
         if item["estoque_id"]:
             est = conn.execute(
-                "SELECT qtd_comprada FROM estoque WHERE id = ?", (item["estoque_id"],)
+                "SELECT qtd_comprada FROM estoque WHERE id = ? AND usuario_id = ?",
+                (item["estoque_id"], uid),
             ).fetchone()
             if est:
                 usado_outros_row = conn.execute(
@@ -1949,7 +2315,9 @@ def editar_material(material_id):
         conn.close()
         return redirect(url_for("detalhe_obra", obra_id=obra_id))
 
-    fornecedores = conn.execute("SELECT * FROM fornecedores ORDER BY nome").fetchall()
+    fornecedores = conn.execute(
+        "SELECT * FROM fornecedores WHERE usuario_id = ? ORDER BY nome", (uid,)
+    ).fetchall()
     conn.close()
 
     cat_opts = "".join(
@@ -2009,15 +2377,23 @@ def editar_material(material_id):
 @app.route("/obra/<int:obra_id>", methods=["GET", "POST"])
 @login_required
 def detalhe_obra(obra_id):
+    uid = current_usuario_id()
     conn = get_db_connection()
+
+    dono_obra = conn.execute(
+        "SELECT id FROM obras WHERE id = ? AND usuario_id = ?", (obra_id, uid)
+    ).fetchone()
+    if not dono_obra:
+        conn.close()
+        return redirect(url_for("index"))
 
     if request.method == "POST":
         if "atualizar_etapa" in request.form:
             etapa_id = request.form["etapa_id"]
             novo_perc = parse_moeda(request.form.get("percentual"))
             conn.execute(
-                "UPDATE etapas_obra SET percentual = ? WHERE id = ?",
-                (novo_perc, etapa_id),
+                "UPDATE etapas_obra SET percentual = ? WHERE id = ? AND obra_id = ?",
+                (novo_perc, etapa_id, obra_id),
             )
             conn.commit()
             conn.close()
@@ -2026,8 +2402,8 @@ def detalhe_obra(obra_id):
         if "salvar_valor_m2" in request.form:
             novo_valor_m2 = parse_moeda(request.form.get("valor_m2_usuario"))
             conn.execute(
-                "UPDATE obras SET valor_m2_usuario = ? WHERE id = ?",
-                (novo_valor_m2, obra_id),
+                "UPDATE obras SET valor_m2_usuario = ? WHERE id = ? AND usuario_id = ?",
+                (novo_valor_m2, obra_id, uid),
             )
             conn.commit()
             conn.close()
@@ -2036,7 +2412,8 @@ def detalhe_obra(obra_id):
         estoque_id = request.form.get("estoque_id")
         if estoque_id:
             item_est = conn.execute(
-                "SELECT * FROM estoque WHERE id = ?", (estoque_id,)
+                "SELECT * FROM estoque WHERE id = ? AND usuario_id = ?",
+                (estoque_id, uid),
             ).fetchone()
             if item_est:
                 usado_row = conn.execute(
@@ -2087,6 +2464,13 @@ def detalhe_obra(obra_id):
             quantidade = parse_moeda(request.form.get("quantidade"))
             valor_unitario = parse_moeda(request.form.get("valor_unitario"))
             fornecedor_id = request.form.get("fornecedor_id") or None
+            if fornecedor_id:
+                forn_ok = conn.execute(
+                    "SELECT id FROM fornecedores WHERE id = ? AND usuario_id = ?",
+                    (fornecedor_id, uid),
+                ).fetchone()
+                if not forn_ok:
+                    fornecedor_id = None
 
             if descricao and quantidade > 0:
                 conn.execute(
@@ -2117,10 +2501,10 @@ def detalhe_obra(obra_id):
         """
         SELECT obras.*, clientes.nome as cliente_nome, clientes.telefone as cliente_tel
         FROM obras
-        LEFT JOIN clientes ON obras.cliente_id = clientes.id
-        WHERE obras.id = ?
+        LEFT JOIN clientes ON obras.cliente_id = clientes.id AND clientes.usuario_id = obras.usuario_id
+        WHERE obras.id = ? AND obras.usuario_id = ?
     """,
-        (obra_id,),
+        (obra_id, uid),
     ).fetchone()
 
     if not obra:
@@ -2131,19 +2515,23 @@ def detalhe_obra(obra_id):
         """
         SELECT materiais_obra.*, fornecedores.nome as fornecedor_nome
         FROM materiais_obra
-        LEFT JOIN fornecedores ON materiais_obra.fornecedor_id = fornecedores.id
+        LEFT JOIN fornecedores ON materiais_obra.fornecedor_id = fornecedores.id AND fornecedores.usuario_id = ?
         WHERE materiais_obra.obra_id = ?
         ORDER BY materiais_obra.id DESC
     """,
-        (obra_id,),
+        (uid, obra_id),
     ).fetchall()
 
     etapas = conn.execute(
         "SELECT * FROM etapas_obra WHERE obra_id = ? ORDER BY id ASC", (obra_id,)
     ).fetchall()
-    fornecedores = conn.execute("SELECT * FROM fornecedores ORDER BY nome").fetchall()
+    fornecedores = conn.execute(
+        "SELECT * FROM fornecedores WHERE usuario_id = ? ORDER BY nome", (uid,)
+    ).fetchall()
 
-    itens_estoque_cursor = conn.execute("SELECT * FROM estoque").fetchall()
+    itens_estoque_cursor = conn.execute(
+        "SELECT * FROM estoque WHERE usuario_id = ?", (uid,)
+    ).fetchall()
     itens_estoque = []
     for item in itens_estoque_cursor:
         usado_row = conn.execute(
@@ -2201,7 +2589,6 @@ def detalhe_obra(obra_id):
             </tr>
         """
 
-    # Tabelas organizadas por categoria (Alvenaria, Hidráulica, Elétrica, Pintura)
     blocos_categorias_html = ""
     for idx_cat, cat_nome in enumerate(CATEGORIAS_OBRA):
         itens_cat = [
@@ -2435,15 +2822,25 @@ def detalhe_obra(obra_id):
 @app.route("/excluir_material/<int:material_id>")
 @login_required
 def excluir_material(material_id):
+    uid = current_usuario_id()
     conn = get_db_connection()
     material = conn.execute(
-        "SELECT obra_id FROM materiais_obra WHERE id = ?", (material_id,)
+        """
+        SELECT materiais_obra.obra_id
+        FROM materiais_obra
+        JOIN obras ON materiais_obra.obra_id = obras.id
+        WHERE materiais_obra.id = ? AND obras.usuario_id = ?
+    """,
+        (material_id, uid),
     ).fetchone()
-    obra_id = material["obra_id"] if material else 1
-    conn.execute("DELETE FROM materiais_obra WHERE id = ?", (material_id,))
-    conn.commit()
+    if material:
+        obra_id = material["obra_id"]
+        conn.execute("DELETE FROM materiais_obra WHERE id = ?", (material_id,))
+        conn.commit()
+        conn.close()
+        return redirect(url_for("detalhe_obra", obra_id=obra_id))
     conn.close()
-    return redirect(url_for("detalhe_obra", obra_id=obra_id))
+    return redirect(url_for("index"))
 
 
 if __name__ == "__main__":
