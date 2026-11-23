@@ -1,8 +1,13 @@
+import base64
 from datetime import date, timedelta
 from functools import wraps
+import hashlib
+import hmac
+import json
 import os
 import re
 import sqlite3
+import time
 from flask import (
     Flask,
     redirect,
@@ -12,13 +17,11 @@ from flask import (
     session,
     url_for,
 )
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "construtora-quality-chave-2026")
-reset_serializer = URLSafeTimedSerializer(app.secret_key)
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
@@ -120,6 +123,42 @@ def parse_moeda(texto):
         return float(limpo)
     except ValueError:
         return 0.0
+
+
+def _gerar_token_redefinicao(user_id: int, senha_hash: str) -> str:
+    payload = {
+        "uid": int(user_id),
+        "exp": int(time.time()) + 1800,
+        "p": (senha_hash or "")[:16],
+    }
+    raw_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(raw_json).decode("ascii").rstrip("=")
+    sig = hmac.new(
+        app.secret_key.encode("utf-8"),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload_b64}.{sig}"
+
+
+def _validar_token_redefinicao(token: str):
+    try:
+        payload_b64, sig = token.split(".", 1)
+        expected_sig = hmac.new(
+            app.secret_key.encode("utf-8"),
+            payload_b64.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None, "invalid"
+        padding = "=" * ((4 - len(payload_b64) % 4) % 4)
+        raw_json = base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii"))
+        dados = json.loads(raw_json.decode("utf-8"))
+        if int(dados.get("exp", 0)) < int(time.time()):
+            return None, "expired"
+        return dados, "ok"
+    except Exception:
+        return None, "invalid"
 
 
 def get_db_connection():
@@ -278,10 +317,31 @@ def init_db():
             "ALTER TABLE materiais_obra ADD COLUMN tipo_item TEXT NOT NULL DEFAULT 'Material'"
         )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pagamentos_mo_obra (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            obra_id INTEGER NOT NULL,
+            fornecedor_id INTEGER,
+            categoria TEXT NOT NULL DEFAULT 'Alvenaria',
+            profissional_nome TEXT NOT NULL,
+            valor_total_contrato REAL NOT NULL DEFAULT 0,
+            valor_parcela REAL NOT NULL DEFAULT 0,
+            observacao TEXT,
+            criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (obra_id) REFERENCES obras (id) ON DELETE CASCADE,
+            FOREIGN KEY (fornecedor_id) REFERENCES fornecedores (id) ON DELETE SET NULL
+        )
+    """
+    )
+
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_clientes_usuario ON clientes (usuario_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_fornecedores_usuario ON fornecedores (usuario_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_estoque_usuario ON estoque (usuario_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_obras_usuario ON obras (usuario_id)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pag_mo_obra_cat ON pagamentos_mo_obra (obra_id, categoria)"
+    )
 
     conn.commit()
     conn.close()
@@ -1124,13 +1184,13 @@ def esqueci_senha():
 
             conn = get_db_connection()
             user_row = conn.execute(
-                "SELECT id, nome, usuario, whatsapp FROM usuarios WHERE LOWER(usuario) = ?",
+                "SELECT id, nome, usuario, whatsapp, senha_hash FROM usuarios WHERE LOWER(usuario) = ?",
                 (usuario_limpo,),
             ).fetchone()
 
             if not user_row and digitos_fone:
                 todos = conn.execute(
-                    "SELECT id, nome, usuario, whatsapp FROM usuarios"
+                    "SELECT id, nome, usuario, whatsapp, senha_hash FROM usuarios"
                 ).fetchall()
                 for u in todos:
                     if re.sub(r"\D", "", u["whatsapp"] or "") == digitos_fone:
@@ -1141,13 +1201,12 @@ def esqueci_senha():
             if not user_row:
                 erro = "Não encontramos nenhum cadastro com esse usuário ou WhatsApp."
             else:
-                token = reset_serializer.dumps(
-                    {"uid": user_row["id"], "pwd_prefix": user_row["senha_hash"][:16]},
-                    salt="recuperar-senha-had",
+                token = _gerar_token_redefinicao(
+                    user_row["id"], user_row["senha_hash"] or ""
                 )
-                link_redefinicao = url_for(
-                    "redefinir_senha", token=token, _external=True
-                )
+                caminho_relativo = url_for("redefinir_senha", token=token)
+                host_base = request.host_url.rstrip("/")
+                link_redefinicao = f"{host_base}{caminho_relativo}"
                 usuario_encontrado = f"{user_row['nome']} (@{user_row['usuario']})"
 
     alerta_html = ""
@@ -1207,12 +1266,14 @@ def redefinir_senha(token):
     erro = ""
     sucesso = ""
     token_valido = False
-    dados_token = None
+    user_row = None
 
-    try:
-        dados_token = reset_serializer.loads(
-            token, salt="recuperar-senha-had", max_age=1800
-        )
+    dados_token, status_token = _validar_token_redefinicao(token)
+    if status_token == "expired":
+        erro = "Este link expirou (prazo de 30 minutos). Solicite um novo link."
+    elif status_token != "ok" or not dados_token:
+        erro = "Link de redefinição inválido."
+    else:
         conn = get_db_connection()
         user_row = conn.execute(
             "SELECT id, nome, usuario, senha_hash FROM usuarios WHERE id = ?",
@@ -1220,14 +1281,10 @@ def redefinir_senha(token):
         ).fetchone()
         conn.close()
 
-        if user_row and user_row["senha_hash"][:16] == dados_token.get("pwd_prefix"):
+        if user_row and (user_row["senha_hash"] or "")[:16] == dados_token.get("p"):
             token_valido = True
         else:
             erro = "Este link de redefinição já foi utilizado ou é inválido."
-    except SignatureExpired:
-        erro = "Este link expirou (prazo de 30 minutos). Solicite um novo link."
-    except BadSignature:
-        erro = "Link de redefinição inválido."
 
     if token_valido and request.method == "POST":
         nova_senha = request.form.get("nova_senha") or ""
@@ -1255,7 +1312,7 @@ def redefinir_senha(token):
         alerta_html = f'<div style="background:rgba(72,187,120,0.18); color:#68d391; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{sucesso}</div>'
 
     form_html = ""
-    if token_valido:
+    if token_valido and user_row:
         form_html = f"""
             <p style="font-size:12px; color:#a0aec0; margin-top:0;">Conta: <strong style="color:#fff;">{user_row["nome"]}</strong> (@{user_row["usuario"]})</p>
             <form method="POST">
@@ -2128,6 +2185,7 @@ def excluir_obra(obra_id):
         "SELECT id FROM obras WHERE id = ? AND usuario_id = ?", (obra_id, uid)
     ).fetchone()
     if obra:
+        conn.execute("DELETE FROM pagamentos_mo_obra WHERE obra_id = ?", (obra_id,))
         conn.execute("DELETE FROM materiais_obra WHERE obra_id = ?", (obra_id,))
         conn.execute("DELETE FROM etapas_obra WHERE obra_id = ?", (obra_id,))
         conn.execute("DELETE FROM obras WHERE id = ? AND usuario_id = ?", (obra_id, uid))
@@ -2350,6 +2408,10 @@ def excluir_fornecedor(fornecedor_id):
     if forn:
         conn.execute(
             "UPDATE materiais_obra SET fornecedor_id = NULL WHERE fornecedor_id = ?",
+            (fornecedor_id,),
+        )
+        conn.execute(
+            "UPDATE pagamentos_mo_obra SET fornecedor_id = NULL WHERE fornecedor_id = ?",
             (fornecedor_id,),
         )
         conn.execute(
@@ -2725,6 +2787,81 @@ def detalhe_obra(obra_id):
             conn.close()
             return redirect(url_for("detalhe_obra", obra_id=obra_id))
 
+        if "registrar_parcela_mo" in request.form:
+            cat_mo = request.form.get("categoria_mo") or "Alvenaria"
+            if cat_mo not in CATEGORIAS_OBRA:
+                cat_mo = "Alvenaria"
+            fornecedor_id_mo = request.form.get("fornecedor_id_mo") or None
+            prof_nome = (request.form.get("profissional_nome") or "").strip()
+            if fornecedor_id_mo:
+                forn_row = conn.execute(
+                    "SELECT id, nome FROM fornecedores WHERE id = ? AND usuario_id = ?",
+                    (fornecedor_id_mo, uid),
+                ).fetchone()
+                if forn_row:
+                    fornecedor_id_mo = forn_row["id"]
+                    if not prof_nome:
+                        prof_nome = forn_row["nome"]
+                else:
+                    fornecedor_id_mo = None
+
+            valor_total_informado = parse_moeda(request.form.get("valor_total_contrato"))
+            valor_parcela = parse_moeda(request.form.get("valor_parcela"))
+            observacao = (request.form.get("observacao_mo") or "").strip()
+
+            if prof_nome and valor_parcela > 0:
+                existente_contrato = conn.execute(
+                    """
+                    SELECT valor_total_contrato
+                    FROM pagamentos_mo_obra
+                    WHERE obra_id = ? AND categoria = ? AND LOWER(profissional_nome) = LOWER(?)
+                    ORDER BY id ASC LIMIT 1
+                """,
+                    (obra_id, cat_mo, prof_nome),
+                ).fetchone()
+
+                total_fixo = (
+                    valor_total_informado
+                    if valor_total_informado > 0
+                    else (
+                        float(existente_contrato["valor_total_contrato"] or 0.0)
+                        if existente_contrato
+                        else valor_parcela
+                    )
+                )
+
+                if valor_total_informado > 0:
+                    conn.execute(
+                        """
+                        UPDATE pagamentos_mo_obra
+                        SET valor_total_contrato = ?
+                        WHERE obra_id = ? AND categoria = ? AND LOWER(profissional_nome) = LOWER(?)
+                    """,
+                        (total_fixo, obra_id, cat_mo, prof_nome),
+                    )
+
+                conn.execute(
+                    """
+                    INSERT INTO pagamentos_mo_obra (
+                        obra_id, fornecedor_id, categoria, profissional_nome,
+                        valor_total_contrato, valor_parcela, observacao
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        obra_id,
+                        fornecedor_id_mo,
+                        cat_mo,
+                        prof_nome,
+                        total_fixo,
+                        valor_parcela,
+                        observacao,
+                    ),
+                )
+                conn.commit()
+            conn.close()
+            return redirect(url_for("detalhe_obra", obra_id=obra_id))
+
         estoque_id = request.form.get("estoque_id")
         if estoque_id:
             item_est = conn.execute(
@@ -2838,6 +2975,11 @@ def detalhe_obra(obra_id):
         (uid, obra_id),
     ).fetchall()
 
+    pagamentos_mo = conn.execute(
+        "SELECT * FROM pagamentos_mo_obra WHERE obra_id = ? ORDER BY id ASC",
+        (obra_id,),
+    ).fetchall()
+
     etapas = conn.execute(
         "SELECT * FROM etapas_obra WHERE obra_id = ? ORDER BY id ASC", (obra_id,)
     ).fetchall()
@@ -2937,6 +3079,96 @@ def detalhe_obra(obra_id):
         else:
             rows_cat = f'<tr><td colspan="8" style="text-align: center; color: #a0aec0;">Nenhum lançamento em {cat_nome}.</td></tr>'
 
+        pag_cat = [
+            p for p in pagamentos_mo if (p["categoria"] or "Alvenaria") == cat_nome
+        ]
+        total_pago_cat = sum(float(p["valor_parcela"] or 0.0) for p in pag_cat)
+        contratos_cat = {}
+        for p in pag_cat:
+            chave = (p["profissional_nome"] or "").strip().lower()
+            if chave not in contratos_cat:
+                contratos_cat[chave] = {
+                    "nome": p["profissional_nome"],
+                    "total_contrato": float(p["valor_total_contrato"] or 0.0),
+                    "pago": 0.0,
+                }
+            contratos_cat[chave]["pago"] += float(p["valor_parcela"] or 0.0)
+            if float(p["valor_total_contrato"] or 0.0) > 0:
+                contratos_cat[chave]["total_contrato"] = float(p["valor_total_contrato"])
+
+        saldo_restante_cat = sum(
+            max(0.0, c["total_contrato"] - c["pago"]) for c in contratos_cat.values()
+        )
+
+        if pag_cat:
+            rows_mo_sub = ""
+            acumulado_por_prof = {}
+            for p in pag_cat:
+                chave = (p["profissional_nome"] or "").strip().lower()
+                total_fixo_item = float(p["valor_total_contrato"] or 0.0)
+                parcela_item = float(p["valor_parcela"] or 0.0)
+                acumulado_por_prof[chave] = acumulado_por_prof.get(chave, 0.0) + parcela_item
+                restante_item = max(0.0, total_fixo_item - acumulado_por_prof[chave])
+                restante_cor = "#48bb78" if restante_item == 0 else "#f6e05e"
+                rows_mo_sub += f"""
+                    <tr>
+                        <td><strong style="color:#fff;">{p["profissional_nome"]}</strong></td>
+                        <td>{p["observacao"] or "Parcela"}</td>
+                        <td>{format_brl(total_fixo_item)}</td>
+                        <td style="color:#63b3ed; font-weight:600;">{format_brl(parcela_item)}</td>
+                        <td style="color:{restante_cor}; font-weight:700;">{format_brl(restante_item)}</td>
+                        <td>
+                            <a href="/excluir_parcela_mo/{p["id"]}" class="btn-excluir" onclick="return confirm('Excluir este registro de parcela?')">Excluir</a>
+                        </td>
+                    </tr>
+                """
+        else:
+            rows_mo_sub = f'<tr><td colspan="6" style="text-align:center; color:#a0aec0;">Nenhum controle de mão de obra parcelada em {cat_nome}.</td></tr>'
+
+        subtabela_mo_html = f"""
+            <div style="margin-top:20px; padding-top:16px; border-top:1px dashed #2d3748;">
+                <h4 style="margin:0 0 8px 0; color:#d4af37; font-size:14px;">
+                    Subtabela — Controle de Mão de Obra ({cat_nome}) · Pago: {format_brl(total_pago_cat)} · Restante: {format_brl(saldo_restante_cat)}
+                </h4>
+                <form method="post" style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-bottom:10px;">
+                    <input type="hidden" name="registrar_parcela_mo" value="1">
+                    <input type="hidden" name="categoria_mo" value="{cat_nome}">
+                    <div style="flex:1; min-width:170px;">
+                        <label>Profissional / M.O.:</label>
+                        <input type="text" name="profissional_nome" placeholder="Ex: Fulano Pedreiro" required style="margin-bottom:0;">
+                    </div>
+                    <div style="width:160px;">
+                        <label>Valor Total Acordado (R$):</label>
+                        <input type="text" name="valor_total_contrato" placeholder="Ex: 30000,00" style="margin-bottom:0;">
+                    </div>
+                    <div style="width:150px;">
+                        <label>Valor Parcela Paga (R$):</label>
+                        <input type="text" name="valor_parcela" placeholder="Ex: 1000,00" required style="margin-bottom:0;">
+                    </div>
+                    <div style="flex:1; min-width:150px;">
+                        <label>Ref. / Parcela:</label>
+                        <input type="text" name="observacao_mo" placeholder="Ex: 1ª parcela" style="margin-bottom:0;">
+                    </div>
+                    <div>
+                        <button type="submit" class="btn" style="padding:10px 14px; font-size:13px;">Lançar Parcela</button>
+                    </div>
+                </form>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Profissional</th>
+                            <th>Parcela / Ref.</th>
+                            <th>Valor Total (Fixo)</th>
+                            <th>Parcela Paga</th>
+                            <th>Saldo Restante</th>
+                            <th>Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows_mo_sub}</tbody>
+                </table>
+            </div>
+        """
+
         sec_id = f"sec-cat-{idx_cat}"
         blocos_categorias_html += f"""
             <div class="card">
@@ -2960,6 +3192,7 @@ def detalhe_obra(obra_id):
                         </thead>
                         <tbody>{rows_cat}</tbody>
                     </table>
+                    {subtabela_mo_html}
                 </div>
             </div>
         """
@@ -3133,6 +3366,30 @@ def detalhe_obra(obra_id):
         </div>
     """
     return render_layout(body, active_menu="resumo")
+
+
+@app.route("/excluir_parcela_mo/<int:parcela_id>")
+@login_required
+def excluir_parcela_mo(parcela_id):
+    uid = current_usuario_id()
+    conn = get_db_connection()
+    row = conn.execute(
+        """
+        SELECT pagamentos_mo_obra.obra_id
+        FROM pagamentos_mo_obra
+        JOIN obras ON pagamentos_mo_obra.obra_id = obras.id
+        WHERE pagamentos_mo_obra.id = ? AND obras.usuario_id = ?
+    """,
+        (parcela_id, uid),
+    ).fetchone()
+    if row:
+        obra_id = row["obra_id"]
+        conn.execute("DELETE FROM pagamentos_mo_obra WHERE id = ?", (parcela_id,))
+        conn.commit()
+        conn.close()
+        return redirect(url_for("detalhe_obra", obra_id=obra_id))
+    conn.close()
+    return redirect(url_for("index"))
 
 
 @app.route("/excluir_material/<int:material_id>")
