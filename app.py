@@ -12,11 +12,13 @@ from flask import (
     session,
     url_for,
 )
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "construtora-quality-chave-2026")
+reset_serializer = URLSafeTimedSerializer(app.secret_key)
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
@@ -335,7 +337,7 @@ def admin_required(f):
 
 
 BASE_CSS = """
-* { box-sizing: border-box; }
+    * { box-sizing: border-box; }
     body {
         font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         margin: 0;
@@ -635,6 +637,8 @@ BASE_CSS = """
         font-size: 12px;
         text-decoration: none;
         font-weight: 600;
+        border: none;
+        cursor: pointer;
         display: inline-block;
         margin-bottom: 4px;
     }
@@ -1087,10 +1091,211 @@ def login():
                         <input type="text" name="usuario" autocomplete="username" required>
                         <label style="font-size:13px; color:#cbd5e0;">Senha:</label>
                         <input type="password" name="senha" autocomplete="current-password" required>
-                        <button type="submit" class="btn" style="width:100%; margin-top:8px;">Entrar</button>
+                        <div style="text-align:right; margin-top:-4px; margin-bottom:10px;">
+                            <a href="/esqueci_senha" style="color:#a0aec0; font-size:12px; text-decoration:none;">Esqueceu sua senha?</a>
+                        </div>
+                        <button type="submit" class="btn" style="width:100%; margin-top:4px;">Entrar</button>
                     </form>
                     <div style="margin-top:16px; text-align:center; font-size:13px;">
                         <a href="/cadastro" style="color:#d4af37; text-decoration:none;">Novo profissional? Solicitar cadastro</a>
+                    </div>
+                </div>
+            </div>
+            <div class="watermark-had">HAD</div>
+        </body>
+        </html>
+    """
+    )
+
+
+@app.route("/esqueci_senha", methods=["GET", "POST"])
+def esqueci_senha():
+    erro = ""
+    link_redefinicao = ""
+    usuario_encontrado = ""
+
+    if request.method == "POST":
+        identificador = (request.form.get("identificador") or "").strip()
+        if not identificador:
+            erro = "Informe seu usuário ou número de WhatsApp cadastrado."
+        else:
+            usuario_limpo = identificador.lower()
+            digitos_fone = re.sub(r"\D", "", identificador)
+
+            conn = get_db_connection()
+            user_row = conn.execute(
+                "SELECT id, nome, usuario, whatsapp FROM usuarios WHERE LOWER(usuario) = ?",
+                (usuario_limpo,),
+            ).fetchone()
+
+            if not user_row and digitos_fone:
+                todos = conn.execute(
+                    "SELECT id, nome, usuario, whatsapp FROM usuarios"
+                ).fetchall()
+                for u in todos:
+                    if re.sub(r"\D", "", u["whatsapp"] or "") == digitos_fone:
+                        user_row = u
+                        break
+            conn.close()
+
+            if not user_row:
+                erro = "Não encontramos nenhum cadastro com esse usuário ou WhatsApp."
+            else:
+                token = reset_serializer.dumps(
+                    {"uid": user_row["id"], "pwd_prefix": user_row["senha_hash"][:16]},
+                    salt="recuperar-senha-had",
+                )
+                link_redefinicao = url_for(
+                    "redefinir_senha", token=token, _external=True
+                )
+                usuario_encontrado = f"{user_row['nome']} (@{user_row['usuario']})"
+
+    alerta_html = ""
+    if erro:
+        alerta_html = f'<div style="background:rgba(231,76,60,0.18); color:#fc8181; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{erro}</div>'
+
+    link_box_html = ""
+    if link_redefinicao:
+        link_box_html = f"""
+            <div style="background:rgba(72,187,120,0.14); border:1px solid #48bb78; color:#e2e8f0; padding:12px; border-radius:6px; margin-bottom:14px; font-size:12px;">
+                <div style="color:#68d391; font-weight:700; margin-bottom:6px;">Link gerado para {usuario_encontrado} (válido por 30 min):</div>
+                <div style="word-break:break-all; background:#111318; padding:8px; border-radius:4px; margin-bottom:10px;">
+                    <a href="{link_redefinicao}" style="color:#d4af37; text-decoration:underline;">{link_redefinicao}</a>
+                </div>
+                <a href="{link_redefinicao}" class="btn" style="width:100%;">Redefinir Senha Agora</a>
+            </div>
+        """
+
+    return render_template_string(
+        f"""
+        <!DOCTYPE html>
+        <html lang="pt-br">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Esqueceu sua Senha - Gestão de Obras</title>
+            <style>{BASE_CSS}</style>
+        </head>
+        <body>
+            <div class="login-container">
+                <div class="login-box">
+                    <div style="margin-bottom:20px; border-bottom:1px solid #2d3748; padding-bottom:15px;">
+                        <h2 style="margin:0; font-size:16px; color:#d4af37;">RECUPERAR SENHA</h2>
+                        <span style="font-size:12px; color:#a0aec0;">Informe seu usuário ou WhatsApp</span>
+                    </div>
+                    {alerta_html}
+                    {link_box_html}
+                    <form method="POST">
+                        <label style="font-size:13px; color:#cbd5e0;">Usuário ou WhatsApp:</label>
+                        <input type="text" name="identificador" placeholder="Ex: meu_usuario ou (17) 99999-9999" required>
+                        <button type="submit" class="btn" style="width:100%; margin-top:8px;">Gerar Link de Redefinição</button>
+                    </form>
+                    <div style="margin-top:16px; text-align:center; font-size:13px;">
+                        <a href="/login" style="color:#d4af37; text-decoration:none;">← Voltar para o Login</a>
+                    </div>
+                </div>
+            </div>
+            <div class="watermark-had">HAD</div>
+        </body>
+        </html>
+    """
+    )
+
+
+@app.route("/redefinir_senha/<token>", methods=["GET", "POST"])
+def redefinir_senha(token):
+    erro = ""
+    sucesso = ""
+    token_valido = False
+    dados_token = None
+
+    try:
+        dados_token = reset_serializer.loads(
+            token, salt="recuperar-senha-had", max_age=1800
+        )
+        conn = get_db_connection()
+        user_row = conn.execute(
+            "SELECT id, nome, usuario, senha_hash FROM usuarios WHERE id = ?",
+            (dados_token.get("uid"),),
+        ).fetchone()
+        conn.close()
+
+        if user_row and user_row["senha_hash"][:16] == dados_token.get("pwd_prefix"):
+            token_valido = True
+        else:
+            erro = "Este link de redefinição já foi utilizado ou é inválido."
+    except SignatureExpired:
+        erro = "Este link expirou (prazo de 30 minutos). Solicite um novo link."
+    except BadSignature:
+        erro = "Link de redefinição inválido."
+
+    if token_valido and request.method == "POST":
+        nova_senha = request.form.get("nova_senha") or ""
+        confirmar_senha = request.form.get("confirmar_senha") or ""
+
+        if len(nova_senha) < 4:
+            erro = "A nova senha deve ter pelo menos 4 caracteres."
+        elif nova_senha != confirmar_senha:
+            erro = "A confirmação da senha não confere."
+        else:
+            conn = get_db_connection()
+            conn.execute(
+                "UPDATE usuarios SET senha_hash = ? WHERE id = ?",
+                (generate_password_hash(nova_senha), user_row["id"]),
+            )
+            conn.commit()
+            conn.close()
+            sucesso = "Senha redefinida com sucesso! Você já pode fazer login."
+            token_valido = False
+
+    alerta_html = ""
+    if erro:
+        alerta_html = f'<div style="background:rgba(231,76,60,0.18); color:#fc8181; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{erro}</div>'
+    elif sucesso:
+        alerta_html = f'<div style="background:rgba(72,187,120,0.18); color:#68d391; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13px;">{sucesso}</div>'
+
+    form_html = ""
+    if token_valido:
+        form_html = f"""
+            <p style="font-size:12px; color:#a0aec0; margin-top:0;">Conta: <strong style="color:#fff;">{user_row["nome"]}</strong> (@{user_row["usuario"]})</p>
+            <form method="POST">
+                <label style="font-size:13px; color:#cbd5e0;">Nova Senha:</label>
+                <input type="password" name="nova_senha" autocomplete="new-password" required>
+
+                <label style="font-size:13px; color:#cbd5e0;">Confirmar Nova Senha:</label>
+                <input type="password" name="confirmar_senha" autocomplete="new-password" required>
+
+                <button type="submit" class="btn" style="width:100%; margin-top:8px;">Salvar Nova Senha</button>
+            </form>
+        """
+    elif not sucesso:
+        form_html = """
+            <div style="text-align:center; margin-top:10px;">
+                <a href="/esqueci_senha" class="btn" style="width:100%;">Solicitar Novo Link</a>
+            </div>
+        """
+
+    return render_template_string(
+        f"""
+        <!DOCTYPE html>
+        <html lang="pt-br">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Redefinir Senha - Gestão de Obras</title>
+            <style>{BASE_CSS}</style>
+        </head>
+        <body>
+            <div class="login-container">
+                <div class="login-box">
+                    <div style="margin-bottom:20px; border-bottom:1px solid #2d3748; padding-bottom:15px;">
+                        <h2 style="margin:0; font-size:16px; color:#d4af37;">NOVA SENHA</h2>
+                        <span style="font-size:12px; color:#a0aec0;">Defina sua nova senha de acesso</span>
+                    </div>
+                    {alerta_html}
+                    {form_html}
+                    <div style="margin-top:16px; text-align:center; font-size:13px;">
+                        <a href="/login" style="color:#d4af37; text-decoration:none;">Ir para o Login</a>
                     </div>
                 </div>
             </div>
@@ -1130,6 +1335,39 @@ def admin_painel():
                     "UPDATE usuarios SET vencimento = ? WHERE id = ?",
                     (novo_venc, user_id),
                 )
+            elif acao == "excluir_usuario":
+                user_alvo = conn.execute(
+                    "SELECT id, logo_arquivo FROM usuarios WHERE id = ?", (user_id,)
+                ).fetchone()
+                if user_alvo:
+                    if user_alvo["logo_arquivo"]:
+                        caminho_logo = os.path.join(
+                            app.config["LOGOS_FOLDER"],
+                            os.path.basename(user_alvo["logo_arquivo"]),
+                        )
+                        if os.path.exists(caminho_logo):
+                            try:
+                                os.remove(caminho_logo)
+                            except OSError:
+                                pass
+
+                    pdfs_user = conn.execute(
+                        "SELECT pdf_projeto FROM obras WHERE usuario_id = ? AND pdf_projeto IS NOT NULL",
+                        (user_id,),
+                    ).fetchall()
+                    for p in pdfs_user:
+                        if p["pdf_projeto"]:
+                            caminho_pdf = os.path.join(
+                                app.config["UPLOAD_FOLDER"],
+                                os.path.basename(p["pdf_projeto"]),
+                            )
+                            if os.path.exists(caminho_pdf):
+                                try:
+                                    os.remove(caminho_pdf)
+                                except OSError:
+                                    pass
+
+                    conn.execute("DELETE FROM usuarios WHERE id = ?", (user_id,))
             conn.commit()
         conn.close()
         return redirect(url_for("admin_painel"))
@@ -1160,6 +1398,7 @@ def admin_painel():
                 .replace("'", "\\'")
                 .replace("\n", "\\n")
             )
+            nome_escapado = (u["nome"] or "").replace("\\", "\\\\").replace("'", "\\'")
             fone_wa = normalizar_whatsapp(u["whatsapp"])
             wa_link = (
                 f"https://wa.me/{fone_wa}?text={msg_cobranca.replace(' ', '%20')}"
@@ -1194,9 +1433,14 @@ def admin_painel():
                             <input type="hidden" name="user_id" value="{u["id"]}">
                             <button type="submit" class="btn-excluir">Trancar</button>
                         </form>
-                        <button type="button" class="btn-detalhe" style="color:#d4af37;" onclick="prepararCobranca('{u["nome"]}', '{msg_escapada}', '{wa_link}')">
+                        <button type="button" class="btn-detalhe" style="color:#d4af37;" onclick="prepararCobranca('{nome_escapado}', '{msg_escapada}', '{wa_link}')">
                             Cobrança WA
                         </button>
+                        <form method="post" style="display:inline; margin:0;" onsubmit="return confirm('Excluir permanentemente o usuário {nome_escapado} e todos os seus dados?')">
+                            <input type="hidden" name="acao" value="excluir_usuario">
+                            <input type="hidden" name="user_id" value="{u["id"]}">
+                            <button type="submit" class="btn-excluir">Excluir</button>
+                        </form>
                     </td>
                 </tr>
             """
@@ -1225,7 +1469,7 @@ def admin_painel():
                     <div class="top-bar-title">
                         <div>
                             <h1>Controle de Assinaturas e Acessos</h1>
-                            <p>Aprovação de cadastros, bloqueio por pendência, vencimento e cobrança via WhatsApp.</p>
+                            <p>Aprovação de cadastros, bloqueio por pendência, vencimento, exclusão e cobrança via WhatsApp.</p>
                         </div>
                     </div>
 
@@ -1936,7 +2180,10 @@ def fornecedores():
                     <td><strong style="color: #fff;">{f["nome"]}</strong></td>
                     <td>{f["telefone"] or "-"}</td>
                     <td>{f["material_principal"] or "-"}</td>
-                    <td><a href="/excluir_fornecedor/{f["id"]}" class="btn-excluir" onclick="return confirm('Excluir fornecedor?')">Excluir</a></td>
+                    <td>
+                        <a href="/editar_fornecedor/{f["id"]}" class="btn-detalhe" style="color: #d4af37;">Editar</a>
+                        <a href="/excluir_fornecedor/{f["id"]}" class="btn-excluir" onclick="return confirm('Excluir fornecedor?')">Excluir</a>
+                    </td>
                 </tr>
             """
         return html
@@ -2017,6 +2264,75 @@ def fornecedores():
                     <tbody>{rows_mo}</tbody>
                 </table>
             </div>
+        </div>
+    """
+    return render_layout(body, active_menu="fornecedores")
+
+
+@app.route("/editar_fornecedor/<int:fornecedor_id>", methods=["GET", "POST"])
+@login_required
+def editar_fornecedor(fornecedor_id):
+    uid = current_usuario_id()
+    conn = get_db_connection()
+    forn = conn.execute(
+        "SELECT * FROM fornecedores WHERE id = ? AND usuario_id = ?",
+        (fornecedor_id, uid),
+    ).fetchone()
+    if not forn:
+        conn.close()
+        return redirect(url_for("fornecedores"))
+
+    if request.method == "POST":
+        nome = (request.form.get("nome") or "").strip()
+        telefone = (request.form.get("telefone") or "").strip()
+        material_principal = (request.form.get("material_principal") or "").strip()
+        tipo_fornecedor = request.form.get("tipo_fornecedor") or "Material"
+        if tipo_fornecedor not in ("Material", "Mão de Obra"):
+            tipo_fornecedor = "Material"
+
+        if nome:
+            conn.execute(
+                """
+                UPDATE fornecedores
+                SET nome = ?, telefone = ?, material_principal = ?, tipo_fornecedor = ?
+                WHERE id = ? AND usuario_id = ?
+            """,
+                (nome, telefone, material_principal, tipo_fornecedor, fornecedor_id, uid),
+            )
+            conn.commit()
+        conn.close()
+        return redirect(url_for("fornecedores"))
+
+    conn.close()
+
+    tipo_atual = forn["tipo_fornecedor"] or "Material"
+    tipo_opts = f"""
+        <option value="Material" {"selected" if tipo_atual == "Material" else ""}>Fornecedor de Materiais</option>
+        <option value="Mão de Obra" {"selected" if tipo_atual == "Mão de Obra" else ""}>Fornecedor de Mão de Obra</option>
+    """
+
+    body = f"""
+        <a href="/fornecedores" class="voltar">← Voltar para Fornecedores</a>
+        <div class="card" style="max-width: 600px;">
+            <h2 style="margin-top:0;">Editar Fornecedor</h2>
+            <form method="post" style="margin-top: 15px;">
+                <label>Tipo:</label>
+                <select name="tipo_fornecedor" required>{tipo_opts}</select>
+
+                <label>Nome:</label>
+                <input type="text" name="nome" value="{forn["nome"]}" required>
+
+                <label>Telefone:</label>
+                <input type="text" name="telefone" value="{forn["telefone"] or ""}">
+
+                <label>Especialidade / Material Principal:</label>
+                <input type="text" name="material_principal" value="{forn["material_principal"] or ""}">
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+                    <button type="submit" class="btn">Salvar Alterações</button>
+                    <a href="/fornecedores" class="btn btn-secundario">Cancelar</a>
+                </div>
+            </form>
         </div>
     """
     return render_layout(body, active_menu="fornecedores")
