@@ -1966,10 +1966,13 @@ def novo_cliente():
                     <td><strong style="color:#fff;">{c["nome"]}</strong></td>
                     <td>{c["telefone"] or "-"}</td>
                     <td>{c["endereco"] or "-"}</td>
+                    <td>
+                        <a href="/editar_cliente/{c["id"]}" class="btn-detalhe" style="color:#d4af37;">Editar</a>
+                    </td>
                 </tr>
             """
     else:
-        cli_rows = '<tr><td colspan="3" style="text-align:center; color:#a0aec0;">Nenhum cliente registado.</td></tr>'
+        cli_rows = '<tr><td colspan="4" style="text-align:center; color:#a0aec0;">Nenhum cliente registado.</td></tr>'
 
     body = f"""
         <a href="/" class="voltar">← Voltar para o Início</a>
@@ -2003,11 +2006,68 @@ def novo_cliente():
                             <th>Nome</th>
                             <th>Telefone</th>
                             <th>Endereço</th>
+                            <th>Ações</th>
                         </tr>
                     </thead>
                     <tbody>{cli_rows}</tbody>
                 </table>
             </div>
+        </div>
+    """
+    return render_layout(body, active_menu="clientes")
+
+
+@app.route("/editar_cliente/<int:cliente_id>", methods=["GET", "POST"])
+@login_required
+def editar_cliente(cliente_id):
+    uid = current_usuario_id()
+    conn = get_db_connection()
+    cli = conn.execute(
+        "SELECT * FROM clientes WHERE id = ? AND usuario_id = ?", (cliente_id, uid)
+    ).fetchone()
+    if not cli:
+        conn.close()
+        return redirect(url_for("novo_cliente"))
+
+    if request.method == "POST":
+        nome = (request.form.get("nome") or "").strip()
+        telefone = (request.form.get("telefone") or "").strip()
+        endereco = (request.form.get("endereco") or "").strip()
+
+        if nome:
+            conn.execute(
+                """
+                UPDATE clientes
+                SET nome = ?, telefone = ?, endereco = ?
+                WHERE id = ? AND usuario_id = ?
+            """,
+                (nome, telefone, endereco, cliente_id, uid),
+            )
+            conn.commit()
+        conn.close()
+        return redirect(url_for("novo_cliente"))
+
+    conn.close()
+
+    body = f"""
+        <a href="/novo_cliente" class="voltar">← Voltar para Clientes</a>
+        <div class="card" style="max-width: 600px;">
+            <h2 style="margin-top:0;">Editar Cliente</h2>
+            <form method="post" style="margin-top: 15px;">
+                <label>Nome:</label>
+                <input type="text" name="nome" value="{cli["nome"]}" required>
+
+                <label>Telefone:</label>
+                <input type="text" name="telefone" value="{cli["telefone"] or ""}">
+
+                <label>Endereço:</label>
+                <input type="text" name="endereco" value="{cli["endereco"] or ""}">
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+                    <button type="submit" class="btn">Salvar Alterações</button>
+                    <a href="/novo_cliente" class="btn btn-secundario">Cancelar</a>
+                </div>
+            </form>
         </div>
     """
     return render_layout(body, active_menu="clientes")
@@ -2577,7 +2637,10 @@ def estoque():
                     <td style="color: #63b3ed; font-weight: bold;">{format_num_br(item["saldo_atual"], 2)} / {format_num_br(item["qtd_comprada"], 2)}</td>
                     <td>{format_brl(item["valor_total_lote"])}</td>
                     <td style="color: #48bb78; font-weight: bold;">{format_brl(item["valor_unitario"])} / {item["unidade"]}</td>
-                    <td><a href="/excluir_estoque/{item["id"]}" class="btn-excluir" onclick="return confirm('Excluir lote?')">Excluir</a></td>
+                    <td>
+                        <a href="/editar_estoque/{item["id"]}" class="btn-detalhe" style="color: #d4af37;">Editar</a>
+                        <a href="/excluir_estoque/{item["id"]}" class="btn-excluir" onclick="return confirm('Excluir lote?')">Excluir</a>
+                    </td>
                 </tr>
             """
     else:
@@ -2650,6 +2713,121 @@ def estoque():
                     <tbody>{rows}</tbody>
                 </table>
             </div>
+        </div>
+    """
+    return render_layout(body, active_menu="estoque")
+
+
+@app.route("/editar_estoque/<int:estoque_id>", methods=["GET", "POST"])
+@login_required
+def editar_estoque(estoque_id):
+    uid = current_usuario_id()
+    conn = get_db_connection()
+    item = conn.execute(
+        "SELECT * FROM estoque WHERE id = ? AND usuario_id = ?", (estoque_id, uid)
+    ).fetchone()
+    if not item:
+        conn.close()
+        return redirect(url_for("estoque"))
+
+    if request.method == "POST":
+        descricao = (request.form.get("descricao") or "").strip()
+        fornecedor_id = request.form.get("fornecedor_id") or None
+        if fornecedor_id:
+            forn_ok = conn.execute(
+                "SELECT id FROM fornecedores WHERE id = ? AND usuario_id = ?",
+                (fornecedor_id, uid),
+            ).fetchone()
+            if not forn_ok:
+                fornecedor_id = None
+
+        unidade = request.form.get("unidade") or "un"
+        qtd_comprada = parse_moeda(request.form.get("qtd_comprada"))
+        valor_total_lote = parse_moeda(request.form.get("valor_total_lote"))
+
+        usado_row = conn.execute(
+            "SELECT SUM(quantidade) as total FROM materiais_obra WHERE estoque_id = ?",
+            (estoque_id,),
+        ).fetchone()
+        usado = float(usado_row["total"] or 0.0)
+
+        if qtd_comprada <= 0:
+            conn.close()
+            return "<script>alert('Erro: A quantidade comprada deve ser maior que zero.'); window.history.back();</script>"
+
+        if qtd_comprada < usado:
+            conn.close()
+            return f"<script>alert('Erro: Quantidade ({format_num_br(qtd_comprada, 2)}) menor que o já alocado nas obras ({format_num_br(usado, 2)}).'); window.history.back();</script>"
+
+        if descricao:
+            conn.execute(
+                """
+                UPDATE estoque
+                SET descricao = ?, fornecedor_id = ?, unidade = ?, qtd_comprada = ?, valor_total_lote = ?
+                WHERE id = ? AND usuario_id = ?
+            """,
+                (
+                    descricao,
+                    fornecedor_id,
+                    unidade,
+                    qtd_comprada,
+                    valor_total_lote,
+                    estoque_id,
+                    uid,
+                ),
+            )
+            conn.commit()
+        conn.close()
+        return redirect(url_for("estoque"))
+
+    fornecedores = conn.execute(
+        "SELECT * FROM fornecedores WHERE usuario_id = ? AND (tipo_fornecedor = 'Material' OR tipo_fornecedor IS NULL) ORDER BY nome",
+        (uid,),
+    ).fetchall()
+    conn.close()
+
+    forn_opts = '<option value="">Nenhum/Outro</option>' + "".join(
+        [
+            f'<option value="{f["id"]}" {"selected" if f["id"] == item["fornecedor_id"] else ""}>{f["nome"]}</option>'
+            for f in fornecedores
+        ]
+    )
+    unidades_padrao = ["m", "m²", "m³", "un", "sc", "kg"]
+    un_atual = item["unidade"] or "un"
+    un_opts = "".join(
+        [
+            f'<option value="{u}" {"selected" if u == un_atual else ""}>{u}</option>'
+            for u in unidades_padrao
+        ]
+    )
+    if un_atual not in unidades_padrao:
+        un_opts += f'<option value="{un_atual}" selected>{un_atual}</option>'
+
+    body = f"""
+        <a href="/estoque" class="voltar">← Voltar para Estoque</a>
+        <div class="card" style="max-width: 600px;">
+            <h2 style="margin-top:0;">Editar Lote de Estoque</h2>
+            <form method="post" style="margin-top: 15px;">
+                <label>Material:</label>
+                <input type="text" name="descricao" value="{item["descricao"]}" required>
+
+                <label>Fornecedor:</label>
+                <select name="fornecedor_id">{forn_opts}</select>
+
+                <label>Unidade:</label>
+                <select name="unidade" required>{un_opts}</select>
+
+                <label>Quantidade Comprada:</label>
+                <input type="text" name="qtd_comprada" value="{format_num_br(item["qtd_comprada"], 2)}" required>
+
+                <label>Valor Total do Lote (R$):</label>
+                <input type="text" name="valor_total_lote" value="{format_num_br(item["valor_total_lote"], 2)}" required>
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+                    <button type="submit" class="btn">Salvar Alterações</button>
+                    <a href="/estoque" class="btn btn-secundario">Cancelar</a>
+                </div>
+            </form>
         </div>
     """
     return render_layout(body, active_menu="estoque")
