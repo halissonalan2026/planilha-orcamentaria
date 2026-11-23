@@ -1827,7 +1827,11 @@ def index():
             "SELECT SUM(valor_total) as total FROM materiais_obra WHERE obra_id = ?",
             (o["id"],),
         ).fetchone()
-        custo_materiais = float(mat_row["total"] or 0.0)
+        mo_row = conn.execute(
+            "SELECT SUM(valor_parcela) as total FROM pagamentos_mo_obra WHERE obra_id = ?",
+            (o["id"],),
+        ).fetchone()
+        custo_materiais = float(mat_row["total"] or 0.0) + float(mo_row["total"] or 0.0)
         terreno = float(o["valor_terreno"] or 0.0)
         financiamento = float(o["valor_financiamento"] or 0.0)
         entrada = float(o["valor_entrada"] or 0.0)
@@ -3155,9 +3159,12 @@ def detalhe_obra(obra_id):
         if etapas
         else 0.0
     )
+    total_mo_parcelas = sum(
+        float(p["valor_parcela"] or 0.0) for p in pagamentos_mo
+    )
     custo_materiais = sum(
         float(m["valor_total"] or 0.0) for m in materiais if m["valor_total"] is not None
-    )
+    ) + total_mo_parcelas
     custo_total_obra = custo_materiais + float(obra["valor_terreno"] or 0.0)
     receita_total = float(obra["valor_financiamento"] or 0.0) + float(
         obra["valor_entrada"] or 0.0
@@ -3197,7 +3204,13 @@ def detalhe_obra(obra_id):
         itens_cat = [
             m for m in materiais if (m["categoria"] or "Alvenaria") == cat_nome
         ]
-        subtotal_cat = sum(float(m["valor_total"] or 0.0) for m in itens_cat)
+        pag_cat = [
+            p for p in pagamentos_mo if (p["categoria"] or "Alvenaria") == cat_nome
+        ]
+        total_pago_cat = sum(float(p["valor_parcela"] or 0.0) for p in pag_cat)
+        subtotal_cat = (
+            sum(float(m["valor_total"] or 0.0) for m in itens_cat) + total_pago_cat
+        )
         if itens_cat:
             rows_cat = ""
             for m in itens_cat:
@@ -3224,10 +3237,6 @@ def detalhe_obra(obra_id):
         else:
             rows_cat = f'<tr><td colspan="8" style="text-align: center; color: #a0aec0;">Nenhum lançamento em {cat_nome}.</td></tr>'
 
-        pag_cat = [
-            p for p in pagamentos_mo if (p["categoria"] or "Alvenaria") == cat_nome
-        ]
-        total_pago_cat = sum(float(p["valor_parcela"] or 0.0) for p in pag_cat)
         contratos_cat = {}
         for p in pag_cat:
             chave = (p["profissional_nome"] or "").strip().lower()
@@ -3248,6 +3257,7 @@ def detalhe_obra(obra_id):
         if pag_cat:
             rows_mo_sub = ""
             acumulado_por_prof = {}
+            prof_ja_exibiu_bruto = set()
             for p in pag_cat:
                 chave = (p["profissional_nome"] or "").strip().lower()
                 total_fixo_item = float(p["valor_total_contrato"] or 0.0)
@@ -3255,11 +3265,18 @@ def detalhe_obra(obra_id):
                 acumulado_por_prof[chave] = acumulado_por_prof.get(chave, 0.0) + parcela_item
                 restante_item = max(0.0, total_fixo_item - acumulado_por_prof[chave])
                 restante_cor = "#48bb78" if restante_item == 0 else "#f6e05e"
+
+                if chave not in prof_ja_exibiu_bruto:
+                    prof_ja_exibiu_bruto.add(chave)
+                    bruto_cell_html = format_brl(total_fixo_item)
+                else:
+                    bruto_cell_html = '<span style="color:#718096;">—</span>'
+
                 rows_mo_sub += f"""
                     <tr>
                         <td><strong style="color:#fff;">{p["profissional_nome"]}</strong></td>
                         <td>{p["observacao"] or "Parcela"}</td>
-                        <td>{format_brl(total_fixo_item)}</td>
+                        <td>{bruto_cell_html}</td>
                         <td style="color:#63b3ed; font-weight:600;">{format_brl(parcela_item)}</td>
                         <td style="color:{restante_cor}; font-weight:700;">{format_brl(restante_item)}</td>
                         <td>
