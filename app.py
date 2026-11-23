@@ -853,14 +853,48 @@ BASE_CSS = """
 
 TOGGLE_SCRIPT = """
 <script>
+const HAD_STATE_KEY = 'had_obra_ui_state_' + window.location.pathname;
+
+function setSectionState(secId, open) {
+    const bodyEl = document.getElementById(secId);
+    if (!bodyEl) return;
+    const headerEl = bodyEl.previousElementSibling;
+    const arrowEl = headerEl ? headerEl.querySelector('.toggle-arrow') : null;
+    if (open) {
+        bodyEl.classList.remove('collapsed');
+        if (arrowEl) arrowEl.textContent = '▾ Fechar';
+    } else {
+        bodyEl.classList.add('collapsed');
+        if (arrowEl) arrowEl.textContent = '▸ Abrir';
+    }
+}
+
 function toggleSection(headerEl, targetId) {
     const bodyEl = document.getElementById(targetId);
-    const arrowEl = headerEl.querySelector('.toggle-arrow');
     if (!bodyEl) return;
-    const isCollapsed = bodyEl.classList.toggle('collapsed');
-    if (arrowEl) {
-        arrowEl.textContent = isCollapsed ? '▸ Abrir' : '▾ Fechar';
-    }
+    const willOpen = bodyEl.classList.contains('collapsed');
+    setSectionState(targetId, willOpen);
+    try {
+        const raw = sessionStorage.getItem(HAD_STATE_KEY);
+        const st = raw ? JSON.parse(raw) : {};
+        st.openSection = willOpen ? targetId : null;
+        sessionStorage.setItem(HAD_STATE_KEY, JSON.stringify(st));
+    } catch (e) {}
+}
+
+function salvarEstadoAtual(secIdOverride) {
+    try {
+        let secId = secIdOverride || null;
+        if (!secId && document.activeElement) {
+            const parentBody = document.activeElement.closest('.collapsible-body');
+            if (parentBody && parentBody.id) secId = parentBody.id;
+        }
+        const st = {
+            openSection: secId,
+            scrollY: window.scrollY || window.pageYOffset || 0
+        };
+        sessionStorage.setItem(HAD_STATE_KEY, JSON.stringify(st));
+    } catch (e) {}
 }
 
 document.addEventListener('DOMContentLoaded', function () {
@@ -872,6 +906,38 @@ document.addEventListener('DOMContentLoaded', function () {
             if (arrow) arrow.textContent = '▸ Abrir';
         }
     });
+
+    document.querySelectorAll('form').forEach(function (formEl) {
+        formEl.addEventListener('submit', function () {
+            const parentBody = formEl.closest('.collapsible-body');
+            salvarEstadoAtual(parentBody ? parentBody.id : null);
+        });
+    });
+
+    document.querySelectorAll('a').forEach(function (aEl) {
+        const href = aEl.getAttribute('href') || '';
+        if (href.includes('/excluir_parcela_mo/') || href.includes('/editar_parcela_mo/') || href.includes('/excluir_material/') || href.includes('/editar_material/')) {
+            aEl.addEventListener('click', function () {
+                const parentBody = aEl.closest('.collapsible-body');
+                salvarEstadoAtual(parentBody ? parentBody.id : null);
+            });
+        }
+    });
+
+    try {
+        const raw = sessionStorage.getItem(HAD_STATE_KEY);
+        if (raw) {
+            const st = JSON.parse(raw);
+            if (st.openSection) {
+                setSectionState(st.openSection, true);
+            }
+            if (typeof st.scrollY === 'number' && st.scrollY > 0) {
+                setTimeout(function () {
+                    window.scrollTo(0, st.scrollY);
+                }, 20);
+            }
+        }
+    } catch (e) {}
 });
 </script>
 """
@@ -2752,6 +2818,85 @@ def editar_material(material_id):
     return render_layout(body, active_menu="resumo")
 
 
+@app.route("/editar_parcela_mo/<int:parcela_id>", methods=["GET", "POST"])
+@login_required
+def editar_parcela_mo(parcela_id):
+    uid = current_usuario_id()
+    conn = get_db_connection()
+    parcela = conn.execute(
+        """
+        SELECT pagamentos_mo_obra.*
+        FROM pagamentos_mo_obra
+        JOIN obras ON pagamentos_mo_obra.obra_id = obras.id
+        WHERE pagamentos_mo_obra.id = ? AND obras.usuario_id = ?
+    """,
+        (parcela_id, uid),
+    ).fetchone()
+    if not parcela:
+        conn.close()
+        return redirect(url_for("index"))
+
+    obra_id = parcela["obra_id"]
+
+    if request.method == "POST":
+        prof_nome = (request.form.get("profissional_nome") or "").strip()
+        valor_total_fixo = parse_moeda(request.form.get("valor_total_contrato"))
+        valor_parcela = parse_moeda(request.form.get("valor_parcela"))
+        observacao = (request.form.get("observacao_mo") or "").strip()
+
+        if prof_nome and valor_parcela > 0:
+            if valor_total_fixo <= 0:
+                valor_total_fixo = valor_parcela
+
+            conn.execute(
+                """
+                UPDATE pagamentos_mo_obra
+                SET profissional_nome = ?, valor_total_contrato = ?, valor_parcela = ?, observacao = ?
+                WHERE id = ?
+            """,
+                (prof_nome, valor_total_fixo, valor_parcela, observacao, parcela_id),
+            )
+            conn.execute(
+                """
+                UPDATE pagamentos_mo_obra
+                SET valor_total_contrato = ?
+                WHERE obra_id = ? AND categoria = ? AND LOWER(profissional_nome) = LOWER(?)
+            """,
+                (valor_total_fixo, obra_id, parcela["categoria"], prof_nome),
+            )
+            conn.commit()
+        conn.close()
+        return redirect(url_for("detalhe_obra", obra_id=obra_id))
+
+    conn.close()
+
+    body = f"""
+        <a href="/obra/{obra_id}" class="voltar">← Voltar para a Obra</a>
+        <div class="card" style="max-width: 600px;">
+            <h2 style="margin-top:0;">Editar Parcela de Mão de Obra ({parcela["categoria"]})</h2>
+            <form method="post" style="margin-top: 15px;">
+                <label>Profissional / M.O.:</label>
+                <input type="text" name="profissional_nome" value="{parcela["profissional_nome"]}" required>
+
+                <label>Valor Total Acordado (Fixo - R$):</label>
+                <input type="text" name="valor_total_contrato" value="{format_num_br(parcela["valor_total_contrato"], 2)}" required>
+
+                <label>Valor da Parcela Paga (R$):</label>
+                <input type="text" name="valor_parcela" value="{format_num_br(parcela["valor_parcela"], 2)}" required>
+
+                <label>Ref. / Parcela:</label>
+                <input type="text" name="observacao_mo" value="{parcela["observacao"] or ""}" placeholder="Ex: 1ª parcela">
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+                    <button type="submit" class="btn">Salvar Alterações</button>
+                    <a href="/obra/{obra_id}" class="btn btn-secundario">Cancelar</a>
+                </div>
+            </form>
+        </div>
+    """
+    return render_layout(body, active_menu="resumo")
+
+
 @app.route("/obra/<int:obra_id>", methods=["GET", "POST"])
 @login_required
 def detalhe_obra(obra_id):
@@ -3118,6 +3263,7 @@ def detalhe_obra(obra_id):
                         <td style="color:#63b3ed; font-weight:600;">{format_brl(parcela_item)}</td>
                         <td style="color:{restante_cor}; font-weight:700;">{format_brl(restante_item)}</td>
                         <td>
+                            <a href="/editar_parcela_mo/{p["id"]}" class="btn-detalhe" style="color:#d4af37;">Editar</a>
                             <a href="/excluir_parcela_mo/{p["id"]}" class="btn-excluir" onclick="return confirm('Excluir este registro de parcela?')">Excluir</a>
                         </td>
                     </tr>
