@@ -1961,6 +1961,7 @@ def novo_cliente():
     cli_rows = ""
     if clientes:
         for c in clientes:
+            nome_esc = (c["nome"] or "").replace("\\", "\\\\").replace("'", "\\'")
             cli_rows += f"""
                 <tr>
                     <td><strong style="color:#fff;">{c["nome"]}</strong></td>
@@ -1968,6 +1969,7 @@ def novo_cliente():
                     <td>{c["endereco"] or "-"}</td>
                     <td>
                         <a href="/editar_cliente/{c["id"]}" class="btn-detalhe" style="color:#d4af37;">Editar</a>
+                        <a href="/excluir_cliente/{c["id"]}" class="btn-excluir" onclick="return confirm('Deseja excluir o cliente {nome_esc}?')">Excluir</a>
                     </td>
                 </tr>
             """
@@ -2071,6 +2073,26 @@ def editar_cliente(cliente_id):
         </div>
     """
     return render_layout(body, active_menu="clientes")
+
+@app.route("/excluir_cliente/<int:cliente_id>")
+@login_required
+def excluir_cliente(cliente_id):
+    uid = current_usuario_id()
+    conn = get_db_connection()
+    cli = conn.execute(
+        "SELECT id FROM clientes WHERE id = ? AND usuario_id = ?", (cliente_id, uid)
+    ).fetchone()
+    if cli:
+        conn.execute(
+            "UPDATE obras SET cliente_id = NULL WHERE cliente_id = ? AND usuario_id = ?",
+            (cliente_id, uid),
+        )
+        conn.execute(
+            "DELETE FROM clientes WHERE id = ? AND usuario_id = ?", (cliente_id, uid)
+        )
+        conn.commit()
+    conn.close()
+    return redirect(url_for("novo_cliente"))
 
 
 @app.route("/nova_obra", methods=["GET", "POST"])
