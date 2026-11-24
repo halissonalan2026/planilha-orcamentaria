@@ -1868,6 +1868,7 @@ def index():
                     <td>{obra["cliente_nome"] or "Sem Cliente"}</td>
                     <td>{format_brl(obra["valor_financiamento"])}</td>
                     <td>{format_num_br(obra["metro_quadrado"], 2)} m²</td>
+                    <td style="color: #e2e8f0; font-weight: 600;">{format_brl(obra["custo_obra"])}</td>
                     <td style="color: {lucro_item_cor}; font-weight: 600;">{format_brl(obra["lucro_obra"])}</td>
                     <td>{pdf_link}</td>
                     <td>
@@ -1878,7 +1879,7 @@ def index():
                 </tr>
             """
     else:
-        linhas_html = '<tr><td colspan="8" style="text-align: center; color: #a0aec0;">Nenhuma obra registada até o momento.</td></tr>'
+        linhas_html = '<tr><td colspan="9" style="text-align: center; color: #a0aec0;">Nenhuma obra registada até o momento.</td></tr>'
 
     body = f"""
         <div class="top-bar-title">
@@ -1920,6 +1921,7 @@ def index():
                             <th>Cliente</th>
                             <th>Financiamento</th>
                             <th>Área (m²)</th>
+                            <th>Orçamento Gasto da Obra</th>
                             <th>Lucro da Obra</th>
                             <th>Projeto PDF</th>
                             <th>Ações</th>
@@ -2073,6 +2075,7 @@ def editar_cliente(cliente_id):
         </div>
     """
     return render_layout(body, active_menu="clientes")
+
 
 @app.route("/excluir_cliente/<int:cliente_id>")
 @login_required
