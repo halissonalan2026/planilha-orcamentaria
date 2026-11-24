@@ -1868,7 +1868,7 @@ def index():
                     <td>{obra["cliente_nome"] or "Sem Cliente"}</td>
                     <td>{format_brl(obra["valor_financiamento"])}</td>
                     <td>{format_num_br(obra["metro_quadrado"], 2)} m²</td>
-                    <td style="color: #e2e8f0; font-weight: 600;">{format_brl(obra["custo_obra"])}</td>
+                    <td style="color: #48bb78; font-weight: 600;">{format_brl(obra["custo_obra"])}</td>
                     <td style="color: {lucro_item_cor}; font-weight: 600;">{format_brl(obra["lucro_obra"])}</td>
                     <td>{pdf_link}</td>
                     <td>
